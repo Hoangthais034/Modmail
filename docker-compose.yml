@@ -24,7 +24,7 @@ services:
       mongo:
         condition: service_started
     ports:
-      - "${LOGVIEWER_HOST_PORT:-38492}:8000"
+      - "${LOGVIEWER_HOST_PORT:-5943}:8000"
     networks:
       - modmail-net
 
@@ -38,7 +38,7 @@ services:
     ports:
       - "${MONGO_HOST_PORT:-27048}:${MONGO_PORT:-27048}"
     volumes:
-      - modmail-mongodb-data:/data/db
+      - ${MONGO_DATA_PATH:-/mnt/modmail/mongodb}:/data/db
     healthcheck:
       test: ["CMD", "mongosh", "--port", "27048", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -51,8 +51,3 @@ services:
 networks:
   modmail-net:
     driver: bridge
-
-volumes:
-  modmail-mongodb-data:
-    name: ${MONGO_VOLUME_NAME:-modmail-mongodb-data}
-    external: true
