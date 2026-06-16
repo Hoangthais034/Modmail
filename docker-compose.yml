@@ -1,28 +1,58 @@
-version: "3.7"
 services:
   bot:
     image: ghcr.io/modmail-dev/modmail:master
-    restart: always
-    env_file:
-      - .env
+    restart: unless-stopped
     environment:
-      - CONNECTION_URI=mongodb://mongo
+      - TOKEN=${TOKEN}
+      - LOG_URL=${LOG_URL}
+      - GUILD_ID=${GUILD_ID}
+      - OWNERS=${OWNERS}
+      - CONNECTION_URI=mongodb://mongo:${MONGO_PORT:-27048}
+      - DISABLE_AUTOUPDATES=${DISABLE_AUTOUPDATES:-true}
     depends_on:
-      - mongo
+      mongo:
+        condition: service_started
+    networks:
+      - modmail-net
+
   logviewer:
     image: ghcr.io/modmail-dev/logviewer:master
-    restart: always
-    depends_on:
-      - mongo
+    restart: unless-stopped
     environment:
-      - MONGO_URI=mongodb://mongo
+      - MONGO_URI=mongodb://mongo:${MONGO_PORT:-27048}
+    depends_on:
+      mongo:
+        condition: service_started
     ports:
-      - 80:8000
+      - "${LOGVIEWER_HOST_PORT:-38492}:8000"
+    networks:
+      - modmail-net
+
   mongo:
-    image: mongo
-    restart: always
+    build:
+      context: ./database/mongo
+    restart: unless-stopped
+    environment:
+      - MONGO_PORT=${MONGO_PORT:-27048}
+      - MONGO_DATABASE=${MONGO_DATABASE:-modmail_bot}
+    ports:
+      - "${MONGO_HOST_PORT:-27048}:${MONGO_PORT:-27048}"
     volumes:
-      - mongodb:/data/db
+      - modmail-mongodb-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27048", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - modmail-net
+
+networks:
+  modmail-net:
+    driver: bridge
 
 volumes:
-  mongodb:
+  modmail-mongodb-data:
+    name: ${MONGO_VOLUME_NAME:-modmail-mongodb-data}
+    external: true

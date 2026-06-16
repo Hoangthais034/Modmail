@@ -10,6 +10,8 @@ config.json
 
 # Data
 temp/
+database/mongo/data/*.gz
+database/mongo/data/*.archive
 
 ### Python
 # Byte-compiled / optimized / DLL files
@@ -39,7 +41,7 @@ venv.bak/
 
 #### VS Code
 .vscode/
-
+.agents/
 ### Windows
 # Windows thumbnail cache files
 Thumbs.db

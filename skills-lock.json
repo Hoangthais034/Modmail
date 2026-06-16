@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "dokploy-docker-compose": {
+      "source": "trfi/skills",
+      "sourceType": "github",
+      "skillPath": "skills/dokploy-docker-compose/SKILL.md",
+      "computedHash": "fba42b8bd9eba70eb1f8514e24d3fa1481130136fe4540af1641a947093e2c6f"
+    }
+  }
+}
