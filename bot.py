@@ -16,6 +16,7 @@ from subprocess import PIPE
 from types import SimpleNamespace
 
 import discord
+from discord import app_commands
 import isodate
 from aiohttp import ClientSession, ClientResponseError
 from discord.ext import commands, tasks
@@ -70,7 +71,7 @@ if sys.platform == "win32":
         logger.error("Failed to use WindowsProactorEventLoopPolicy.", exc_info=True)
 
 
-class ModmailCommandTree(commands.CommandTree):
+class ModmailCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Enforce Modmail permission levels for slash command interactions."""
         if not await checks.check_interaction_permissions(interaction):
