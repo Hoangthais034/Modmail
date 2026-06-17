@@ -272,10 +272,21 @@ class ModmailBot(commands.Bot):
             )
             return
 
-        logger.info("Registering %d slash command(s) for guild sync.", scoped)
+        logger.info(
+            "Registering %d slash command(s) for guild sync (enable_slash_commands=%s, guild_id=%s).",
+            scoped,
+            self.config.get("enable_slash_commands"),
+            self.guild_id,
+        )
         for guild in self._get_slash_guild_objects():
             synced = await self.tree.sync(guild=guild)
             logger.info("Synced %d slash command(s) to guild %s.", len(synced), guild.id)
+            if len(synced) == 0 and scoped > 0:
+                logger.warning(
+                    "Guild slash sync returned 0 commands despite %d scoped command(s). "
+                    "Confirm the bot was invited with the applications.commands scope.",
+                    scoped,
+                )
 
     @property
     def version(self):

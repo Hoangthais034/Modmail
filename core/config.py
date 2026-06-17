@@ -309,6 +309,7 @@ class ConfigManager:
     def __init__(self, bot):
         self.bot = bot
         self._cache = {}
+        self._env_protected_overrides = {}
         self.ready_event = asyncio.Event()
         self.config_help = {}
 
@@ -336,7 +337,21 @@ class ConfigManager:
         with open(config_help_json, "r", encoding="utf-8") as f:
             self.config_help = dict(sorted(json.load(f).items()))
 
+        self._capture_env_protected_overrides()
         return self._cache
+
+    def _capture_env_protected_overrides(self) -> None:
+        """Remember protected config keys supplied via environment for post-refresh reapply."""
+        self._env_protected_overrides = {
+            k.lower(): v
+            for k, v in os.environ.items()
+            if k.lower() in self.protected_keys
+        }
+
+    def _apply_env_protected_overrides(self) -> None:
+        """Reapply protected keys from environment after loading database config."""
+        for key, value in self._env_protected_overrides.items():
+            self._cache[key] = value
 
     async def update(self):
         """Updates the config with data from the cache"""
@@ -348,6 +363,7 @@ class ConfigManager:
             k = k.lower()
             if k in self.all_keys:
                 self._cache[k] = v
+        self._apply_env_protected_overrides()
         if not self.ready_event.is_set():
             self.ready_event.set()
             logger.debug("Successfully fetched configurations from database.")
