@@ -202,15 +202,16 @@ class ModmailBot(commands.Bot):
 
     async def setup_hook(self):
         """Register slash hooks and sync commands after extensions are available."""
-        self.before_invoke(self._before_invoke)
+
+        @self.before_invoke
+        async def resolve_modmail_thread(ctx):
+            """Resolve Modmail thread context for slash invocations that skip get_contexts."""
+            if ctx.thread is None and ctx.channel is not None:
+                ctx.thread = await self.threads.find(channel=ctx.channel)
+
         self.tree.interaction_check(self._slash_interaction_check)
         if self.extensions:
             await self._sync_slash_commands()
-
-    async def _before_invoke(self, ctx):
-        """Resolve Modmail thread context for slash invocations that skip get_contexts."""
-        if ctx.thread is None and ctx.channel is not None:
-            ctx.thread = await self.threads.find(channel=ctx.channel)
 
     async def _slash_interaction_check(self, interaction: discord.Interaction) -> bool:
         """Enforce Modmail permission levels for slash command interactions."""
