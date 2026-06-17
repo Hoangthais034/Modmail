@@ -1,3 +1,4 @@
+import re
 import secrets
 import sys
 from json import JSONDecodeError
@@ -358,6 +359,12 @@ class ApiClient:
     async def get_user_logs(self, user_id: Union[str, int]) -> list:
         return NotImplemented
 
+    async def search_log_recipients(self, query: str = "", *, limit: int = 25) -> list:
+        return NotImplemented
+
+    async def search_log_keys(self, query: str = "", *, limit: int = 25) -> list:
+        return NotImplemented
+
     async def find_log_entry(self, key: str) -> list:
         return NotImplemented
 
@@ -537,6 +544,72 @@ class MongoDBClient(ApiClient):
         logger.debug("Retrieving user %s logs.", user_id)
 
         return await self.logs.find(query, projection).to_list(None)
+
+    async def search_log_recipients(self, query: str = "", *, limit: int = 25) -> list:
+        """Return distinct log recipients ordered by most recently closed thread."""
+        guild_id = str(self.bot.guild_id)
+        effective_limit = 10 if not query else min(limit, 25)
+        pipeline = [
+            {
+                "$match": {
+                    "guild_id": guild_id,
+                    "open": False,
+                    "recipient.id": {"$exists": True},
+                    "closed_at": {"$ne": None},
+                }
+            },
+            {"$sort": {"closed_at": -1}},
+            {
+                "$group": {
+                    "_id": "$recipient.id",
+                    "recipient": {"$first": "$recipient"},
+                    "latest_closed_at": {"$first": "$closed_at"},
+                }
+            },
+            {"$sort": {"latest_closed_at": -1}},
+        ]
+        if query:
+            escaped = re.escape(query)
+            pipeline.append(
+                {
+                    "$match": {
+                        "$or": [
+                            {"recipient.name": {"$regex": escaped, "$options": "i"}},
+                            {"_id": {"$regex": escaped, "$options": "i"}},
+                        ]
+                    }
+                }
+            )
+        pipeline.append({"$limit": effective_limit})
+        results = []
+        async for doc in self.logs.aggregate(pipeline):
+            recipient = doc.get("recipient") or {}
+            recipient_id = recipient.get("id") or doc.get("_id")
+            if not recipient_id:
+                continue
+            results.append(
+                {
+                    "id": str(recipient_id),
+                    "name": recipient.get("name", "Unknown"),
+                    "discriminator": recipient.get("discriminator", "0"),
+                }
+            )
+        return results
+
+    async def search_log_keys(self, query: str = "", *, limit: int = 25) -> list:
+        """Return recent closed log keys, optionally filtered by prefix."""
+        guild_id = str(self.bot.guild_id)
+        effective_limit = 10 if not query else min(limit, 25)
+        match = {"guild_id": guild_id, "open": False}
+        if query:
+            match["key"] = {"$regex": f"^{re.escape(query)}", "$options": "i"}
+        cursor = self.logs.find(match, {"key": 1}).sort("closed_at", -1).limit(effective_limit)
+        keys = []
+        async for doc in cursor:
+            key = doc.get("key")
+            if key:
+                keys.append(key)
+        return keys
 
     async def find_log_entry(self, key: str) -> list:
         query = {"key": key}

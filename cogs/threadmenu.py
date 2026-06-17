@@ -3,9 +3,11 @@ import asyncio
 from copy import copy as _copy
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from core import checks
+from core.autocomplete import threadmenu_label_autocomplete
 from core.models import PermissionLevel
 
 
@@ -14,10 +16,33 @@ class ThreadCreationMenuCore(commands.Cog):
 
     This Cog exposes the same commands as the legacy plugin to manage menu options,
     but stores settings in core config (no plugin DB).
+
+    Prefix-only wizards (multi-step prompts): `threadmenu option add`,
+    `threadmenu submenu option add`, and `threadmenu submenu option edit`.
     """
 
     def __init__(self, bot):
         self.bot = bot
+
+    def _guilds(self) -> list[discord.Object]:
+        """Return guild scopes for slash command registration."""
+        guilds = []
+        if self.bot.guild_id:
+            guilds.append(discord.Object(id=self.bot.guild_id))
+        if self.bot.using_multiple_server_setup:
+            modmail_guild_id = self.bot.config.get("modmail_guild_id")
+            if modmail_guild_id is not None:
+                try:
+                    guilds.append(discord.Object(id=int(modmail_guild_id)))
+                except (TypeError, ValueError):
+                    pass
+        return guilds
+
+    async def cog_load(self):
+        guilds = self._guilds()
+        if guilds:
+            for command in self.walk_app_commands():
+                command.guilds = guilds
 
     # ----- helpers -----
     def _get_conf(self) -> dict:
@@ -70,7 +95,7 @@ class ThreadCreationMenuCore(commands.Cog):
 
     # ----- commands -----
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     async def threadmenu(self, ctx):
         """Thread-creation menu settings (core)."""
         await ctx.send_help(ctx.command)
@@ -120,6 +145,8 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @threadmenu_option.command(name="show")
+    @app_commands.describe(label="Main menu option label")
+    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
     async def threadmenu_option_show(self, ctx, *, label: str):
         """Show detailed information about a main-menu option."""
         conf = self._get_conf()
@@ -146,7 +173,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send(embed=embed)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_option.command(name="add")
+    @threadmenu_option.command(name="add", with_app_command=False)
     async def threadmenu_option_add(self, ctx):
         """Interactive wizard to add a main-menu option."""
         conf = self._get_conf()
@@ -271,6 +298,8 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @threadmenu_option.command(name="remove")
+    @app_commands.describe(label="Main menu option label")
+    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
     async def threadmenu_option_remove(self, ctx, *, label: str):
         """Remove a main-menu option by label."""
         conf = self._get_conf()
@@ -283,6 +312,8 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @threadmenu_option.command(name="edit")
+    @app_commands.describe(label="Main menu option label")
+    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
     async def threadmenu_option_edit(self, ctx, *, label: str):
         """Interactive wizard to edit a main-menu option."""
         conf = self._get_conf()
@@ -415,6 +446,8 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @threadmenu_submenu.command(name="create")
+    @app_commands.describe(label="Submenu label")
+    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
     async def threadmenu_submenu_create(self, ctx, *, label: str):
         """Create an empty submenu that can hold nested options."""
         conf = self._get_conf()
@@ -429,6 +462,8 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @threadmenu_submenu.command(name="delete")
+    @app_commands.describe(label="Submenu label")
+    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
     async def threadmenu_submenu_delete(self, ctx, *, label: str):
         """Delete a submenu and all its options."""
         conf = self._get_conf()
@@ -453,6 +488,8 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @threadmenu_submenu.command(name="show")
+    @app_commands.describe(label="Submenu label")
+    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
     async def threadmenu_submenu_show(self, ctx, *, label: str):
         """Show the options configured inside a submenu."""
         conf = self._get_conf()
@@ -473,7 +510,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send_help(ctx.command)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu_option.command(name="add")
+    @threadmenu_submenu_option.command(name="add", with_app_command=False)
     async def threadmenu_submenu_option_add(self, ctx, *, submenu: str):
         """Interactive wizard to add an option inside a submenu."""
         conf = self._get_conf()
@@ -592,6 +629,8 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @threadmenu_submenu_option.command(name="remove")
+    @app_commands.describe(submenu="Submenu label")
+    @app_commands.autocomplete(submenu=threadmenu_label_autocomplete)
     async def threadmenu_submenu_option_remove(self, ctx, *, submenu: str):
         """Remove an option from a submenu via an interactive prompt."""
         conf = self._get_conf()
@@ -616,7 +655,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send("Option removed.")
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu_option.command(name="edit")
+    @threadmenu_submenu_option.command(name="edit", with_app_command=False)
     async def threadmenu_submenu_option_edit(self, ctx, *, submenu: str):
         """Interactive wizard to edit a submenu option."""
         conf = self._get_conf()

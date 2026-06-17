@@ -200,6 +200,49 @@ class ModmailBot(commands.Bot):
                 logger.exception("Failed to load %s.", cog)
         logger.line("debug")
 
+    async def setup_hook(self):
+        """Register slash hooks and sync commands after extensions are available."""
+        self.before_invoke(self._before_invoke)
+        self.tree.interaction_check(self._slash_interaction_check)
+        if self.extensions:
+            await self._sync_slash_commands()
+
+    async def _before_invoke(self, ctx):
+        """Resolve Modmail thread context for slash invocations that skip get_contexts."""
+        if ctx.thread is None and ctx.channel is not None:
+            ctx.thread = await self.threads.find(channel=ctx.channel)
+
+    async def _slash_interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Enforce Modmail permission levels for slash command interactions."""
+        if not await checks.check_interaction_permissions(interaction):
+            if interaction.response.is_done():
+                await interaction.followup.send("You do not have permission.", ephemeral=True)
+            else:
+                await interaction.response.send_message("You do not have permission.", ephemeral=True)
+            return False
+        return True
+
+    async def _sync_slash_commands(self):
+        """Sync the application command tree to configured guilds when enabled."""
+        if not self.config.get("enable_slash_commands"):
+            return
+        if not self.guild_id:
+            logger.warning("ENABLE_SLASH_COMMANDS is set but GUILD_ID is missing; skipping slash sync.")
+            return
+
+        guilds = [discord.Object(id=self.guild_id)]
+        if self.using_multiple_server_setup:
+            modmail_guild_id = self.config.get("modmail_guild_id")
+            if modmail_guild_id is not None:
+                try:
+                    guilds.append(discord.Object(id=int(modmail_guild_id)))
+                except (TypeError, ValueError):
+                    logger.warning("Invalid MODMAIL_GUILD_ID; skipping modmail guild slash sync.")
+
+        for guild in guilds:
+            synced = await self.tree.sync(guild=guild)
+            logger.info("Synced %d slash command(s) to guild %s.", len(synced), guild.id)
+
     @property
     def version(self):
         return Version(__version__)
@@ -524,6 +567,7 @@ class ModmailBot(commands.Bot):
         await self.config.refresh()
         await self.api.setup_indexes()
         await self.load_extensions()
+        await self._sync_slash_commands()
         self._connected.set()
 
     async def on_ready(self):

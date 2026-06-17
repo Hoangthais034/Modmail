@@ -42,6 +42,9 @@ venv.bak/
 #### VS Code
 .vscode/
 .agents/
+.cursor/
+.claude/
+
 ### Windows
 # Windows thumbnail cache files
 Thumbs.db

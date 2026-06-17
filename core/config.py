@@ -211,6 +211,7 @@ class ConfigManager:
         "token": None,
         "enable_plugins": True,
         "enable_eval": True,
+        "enable_slash_commands": False,
         # github access token for private repositories
         "github_token": None,
         "disable_autoupdates": False,
@@ -265,6 +266,7 @@ class ConfigManager:
         "confirm_thread_creation",
         "use_regex_autotrigger",
         "enable_plugins",
+        "enable_slash_commands",
         "data_collection",
         "enable_eval",
         "disable_autoupdates",

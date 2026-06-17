@@ -12,10 +12,11 @@ from itertools import takewhile, zip_longest
 from json import JSONDecodeError, loads
 from subprocess import PIPE
 from textwrap import indent
-from typing import Union
+from typing import Optional, Union
 import typing
 
 import discord
+from discord import app_commands
 from discord.enums import ActivityType, Status
 from discord.ext import commands, tasks
 from discord.ext.commands.view import StringView
@@ -24,6 +25,13 @@ from aiohttp import ClientResponseError
 from packaging.version import Version
 
 from core import checks, utils
+from core.autocomplete import (
+    alias_autocomplete,
+    command_name_autocomplete,
+    config_key_autocomplete,
+    guild_member_autocomplete,
+    guild_role_autocomplete,
+)
 from core.changelog import Changelog
 from core.models import (
     HostingMethod,
@@ -37,6 +45,148 @@ from core.paginator import EmbedPaginatorSession, MessagePaginatorSession
 
 
 logger = getLogger(__name__)
+
+_ACTIVITY_TYPES = ("playing", "streaming", "listening", "watching", "competing", "custom", "clear")
+_STATUS_TYPES = (
+    ("online", "online"),
+    ("idle", "idle"),
+    ("dnd", "dnd"),
+    ("do not disturb", "dnd"),
+    ("invisible", "invisible"),
+    ("offline", "offline"),
+    ("clear", "clear"),
+)
+_PERMISSION_LEVELS = ("OWNER", "ADMINISTRATOR", "MODERATOR", "SUPPORTER", "REGULAR", "1", "2", "3", "4", "5")
+_PERMISSION_TYPES = ("command", "level", "override")
+
+
+async def member_role_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest guild members and roles for slash parameters."""
+    members = await guild_member_autocomplete(interaction, current)
+    roles = await guild_role_autocomplete(interaction, current)
+    return (members + roles)[:25]
+
+
+async def changelog_version_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest changelog version tags from the remote changelog data."""
+    bot = interaction.client
+    try:
+        changelog = await Changelog.from_url(bot)
+        versions = [version.version for version in changelog.versions]
+    except Exception:
+        return []
+
+    current_lower = current.casefold().lstrip("v")
+    if current_lower:
+        versions = [version for version in versions if current_lower in version.casefold()]
+
+    choices = []
+    for version in versions[:25]:
+        choices.append(app_commands.Choice(name=f"v{version}"[:100], value=version))
+    return choices
+
+
+async def activity_type_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest fixed bot activity types for slash parameters."""
+    current_lower = current.casefold()
+    choices = []
+    for activity_type in _ACTIVITY_TYPES:
+        if not current_lower or activity_type.startswith(current_lower):
+            choices.append(app_commands.Choice(name=activity_type, value=activity_type))
+    return choices[:25]
+
+
+async def status_type_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest fixed bot status types for slash parameters."""
+    current_lower = current.casefold()
+    choices = []
+    for display_name, value in _STATUS_TYPES:
+        if not current_lower or display_name.startswith(current_lower) or value.startswith(current_lower):
+            choices.append(app_commands.Choice(name=display_name, value=value))
+    return choices[:25]
+
+
+async def permission_level_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest permission level names and numeric shortcuts."""
+    current_lower = current.casefold()
+    choices = []
+    for level_name in _PERMISSION_LEVELS:
+        if not current_lower or current_lower in level_name.casefold():
+            choices.append(app_commands.Choice(name=level_name, value=level_name))
+    return choices[:25]
+
+
+async def permission_type_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest permission subcommand target types."""
+    current_lower = current.casefold()
+    choices = []
+    for type_name in _PERMISSION_TYPES:
+        if not current_lower or type_name.startswith(current_lower):
+            choices.append(app_commands.Choice(name=type_name, value=type_name))
+    return choices[:25]
+
+
+async def permissions_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest command names and permission levels for permissions add/remove/get."""
+    commands = await command_name_autocomplete(interaction, current)
+    levels = await permission_level_autocomplete(interaction, current)
+    return (commands + levels)[:25]
+
+
+async def autotrigger_keyword_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest configured autotrigger keywords."""
+    bot = interaction.client
+    keywords = sorted(bot.auto_triggers.keys())
+    current_lower = current.casefold()
+    if current_lower:
+        keywords = [keyword for keyword in keywords if current_lower in keyword.casefold()]
+
+    choices = []
+    for keyword in keywords[:25]:
+        choices.append(app_commands.Choice(name=keyword[:100], value=keyword))
+    return choices
+
+
+async def mention_target_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest members, roles, and mention preset keywords."""
+    choices = []
+    current_lower = (current or "").casefold()
+    for keyword in ("disable", "reset", "everyone", "all"):
+        if not current_lower or keyword.startswith(current_lower):
+            choices.append(app_commands.Choice(name=keyword, value=keyword))
+    choices.extend(await member_role_autocomplete(interaction, current))
+    return choices[:25]
+
+
+async def permissions_get_target_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest members, roles, and permissions get modes."""
+    choices = []
+    current_lower = (current or "").casefold()
+    for keyword in ("command", "level", "override"):
+        if not current_lower or keyword.startswith(current_lower):
+            choices.append(app_commands.Choice(name=keyword, value=keyword))
+    choices.extend(await member_role_autocomplete(interaction, current))
+    return choices[:25]
 
 
 class ModmailHelpCommand(commands.HelpCommand):
@@ -277,26 +427,119 @@ class Utility(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._original_help_command = bot.help_command
-        self.bot.help_command = ModmailHelpCommand(
+        self._custom_help = ModmailHelpCommand(
             command_attrs={
                 "help": "Shows this help message.",
                 "checks": [checks.has_permissions_predicate(PermissionLevel.REGULAR)],
             },
         )
-        self.bot.help_command.cog = self
+        self._custom_help.cog = self
+        self.bot.help_command = None
         if not self.bot.config.get("enable_eval"):
             self.eval_.enabled = False
             logger.info("Eval disabled. enable_eval=False")
 
+    def _guilds(self) -> list[discord.Object]:
+        """Return guild scopes for slash command registration."""
+        guilds = []
+        if self.bot.guild_id:
+            guilds.append(discord.Object(id=self.bot.guild_id))
+        if self.bot.using_multiple_server_setup:
+            modmail_guild_id = self.bot.config.get("modmail_guild_id")
+            if modmail_guild_id is not None:
+                try:
+                    guilds.append(discord.Object(id=int(modmail_guild_id)))
+                except (TypeError, ValueError):
+                    pass
+        return guilds
+
+    def _collect_users(self, *users) -> list:
+        """Gather optional slash user parameters into a list."""
+        return [user for user in users if user is not None]
+
+    async def _resolve_member_role(self, ctx, target):
+        """Resolve a member or role from slash autocomplete snowflakes."""
+        if target is None:
+            return None
+        if isinstance(target, (discord.Member, discord.Role)):
+            return target
+        if isinstance(target, utils.User):
+            guild = ctx.guild or self.bot.modmail_guild
+            if guild is not None:
+                member = guild.get_member(target.id)
+                if member is not None:
+                    return member
+            return target
+        if isinstance(target, str):
+            lowered = target.casefold()
+            if lowered in ("everyone", "all"):
+                return lowered
+            guild = ctx.guild or self.bot.modmail_guild
+            if guild is not None and target.isdigit():
+                member = guild.get_member(int(target))
+                if member is not None:
+                    return member
+                role = guild.get_role(int(target))
+                if role is not None:
+                    return role
+            try:
+                return await commands.MemberConverter().convert(ctx, target)
+            except commands.BadArgument:
+                pass
+            try:
+                return await commands.RoleConverter().convert(ctx, target)
+            except commands.BadArgument:
+                pass
+            try:
+                return await utils.User().convert(ctx, target)
+            except commands.BadArgument:
+                pass
+        return target
+
+    async def _resolve_mention_target(self, ctx, target):
+        """Resolve mention command targets from slash autocomplete values."""
+        if target is None:
+            return None
+        if isinstance(target, (discord.Member, discord.Role)):
+            return target
+        if isinstance(target, str):
+            lowered = target.casefold()
+            if lowered in ("disable", "reset", "everyone", "all"):
+                return lowered
+            guild = ctx.guild or self.bot.modmail_guild
+            if guild is not None and target.isdigit():
+                member = guild.get_member(int(target))
+                if member is not None:
+                    return member
+                role = guild.get_role(int(target))
+                if role is not None:
+                    return role
+        return target
+
     async def cog_load(self):
+        guilds = self._guilds()
+        if guilds:
+            for command in self.walk_app_commands():
+                command.guilds = guilds
         self.loop_presence.start()  # pylint: disable=no-member
 
     def cog_unload(self):
         self.bot.help_command = self._original_help_command
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.REGULAR)
     @utils.trigger_typing
+    @app_commands.describe(command="Command or category to get help for")
+    @app_commands.autocomplete(command=command_name_autocomplete)
+    async def help(self, ctx, *, command: str = None):
+        """Shows this help message."""
+        await self._custom_help.command_callback(ctx, command=command)
+
+    @commands.hybrid_command()
+    @checks.has_permissions(PermissionLevel.REGULAR)
+    @utils.trigger_typing
+    @app_commands.describe(version="Changelog version tag to display")
+    @app_commands.autocomplete(version=changelog_version_autocomplete)
     async def changelog(self, ctx, version: str.lower = ""):
         """Shows the changelog of the Modmail."""
         changelog = await Changelog.from_url(self.bot)
@@ -327,7 +570,7 @@ class Utility(commands.Cog):
                     f"View the changelog here: {changelog.latest_version.changelog_url}#v{version[::2]}"
                 )
 
-    @commands.command(aliases=["info"])
+    @commands.hybrid_command(aliases=["info"])
     @checks.has_permissions(PermissionLevel.REGULAR)
     @utils.trigger_typing
     async def about(self, ctx):
@@ -386,7 +629,7 @@ class Utility(commands.Cog):
         embed.set_footer(text=footer)
         await ctx.send(embed=embed)
 
-    @commands.command(aliases=["sponsor"])
+    @commands.hybrid_command(aliases=["sponsor"])
     @checks.has_permissions(PermissionLevel.REGULAR)
     @utils.trigger_typing
     async def sponsors(self, ctx):
@@ -408,7 +651,7 @@ class Utility(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.OWNER)
     @utils.trigger_typing
     async def debug(self, ctx):
@@ -500,8 +743,13 @@ class Utility(commands.Cog):
             embed=discord.Embed(color=self.bot.main_color, description="Cached logs are now cleared.")
         )
 
-    @commands.command(aliases=["presence"])
+    @commands.hybrid_command(aliases=["presence"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @app_commands.describe(
+        activity_type="Bot activity type",
+        message="Activity message text",
+    )
+    @app_commands.autocomplete(activity_type=activity_type_autocomplete)
     async def activity(self, ctx, activity_type: str.lower, *, message: str = ""):
         """
         Set an activity status for the bot.
@@ -563,8 +811,10 @@ class Utility(commands.Cog):
         embed = discord.Embed(title="Activity Changed", description=msg, color=self.bot.main_color)
         return await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @app_commands.describe(status_type="Bot status type")
+    @app_commands.autocomplete(status_type=status_type_autocomplete)
     async def status(self, ctx, *, status_type: str.lower):
         """
         Set a status for the bot.
@@ -666,7 +916,7 @@ class Utility(commands.Cog):
         await asyncio.sleep(1800)
         logger.info("Starting presence loop.")
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @utils.trigger_typing
     async def ping(self, ctx):
@@ -678,9 +928,32 @@ class Utility(commands.Cog):
         )
         return await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def mention(self, ctx, *user_or_role: Union[discord.Role, discord.Member, str]):
+    @app_commands.describe(
+        user1="First user or role to mention",
+        user2="Second user or role to mention",
+        user3="Third user or role to mention",
+        user4="Fourth user or role to mention",
+        user5="Fifth user or role to mention",
+    )
+    @app_commands.autocomplete(
+        user1=mention_target_autocomplete,
+        user2=mention_target_autocomplete,
+        user3=mention_target_autocomplete,
+        user4=mention_target_autocomplete,
+        user5=mention_target_autocomplete,
+    )
+    async def mention(
+        self,
+        ctx,
+        *user_or_role: commands.Greedy[Union[discord.Role, discord.Member, str]],
+        user1: Optional[str] = None,
+        user2: Optional[str] = None,
+        user3: Optional[str] = None,
+        user4: Optional[str] = None,
+        user5: Optional[str] = None,
+    ):
         """
         Change what the bot mentions at the start of each thread.
 
@@ -700,6 +973,14 @@ class Utility(commands.Cog):
         - `{prefix}mention disable` to disable mention.
         - `{prefix}mention reset` to reset it to default value, which is "@here".
         """
+        if ctx.interaction is not None:
+            raw_targets = self._collect_users(user1, user2, user3, user4, user5)
+            user_or_role = []
+            for target in raw_targets:
+                resolved = await self._resolve_mention_target(ctx, target)
+                if resolved is not None:
+                    user_or_role.append(resolved)
+
         current = self.bot.config["mention"]
         if not user_or_role:
             embed = discord.Embed(
@@ -748,8 +1029,9 @@ class Utility(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @app_commands.describe(prefix="New bot command prefix")
     async def prefix(self, ctx, *, prefix=None):
         """
         Change the prefix of the bot.
@@ -769,7 +1051,7 @@ class Utility(commands.Cog):
             await self.bot.config.update()
             await ctx.send(embed=embed)
 
-    @commands.group(aliases=["configuration"], invoke_without_command=True)
+    @commands.hybrid_group(aliases=["configuration"], invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.OWNER)
     async def config(self, ctx):
         """
@@ -808,6 +1090,8 @@ class Utility(commands.Cog):
 
     @config.command(name="set", aliases=["add"])
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(key="Configuration key to set", value="Configuration value")
+    @app_commands.autocomplete(key=config_key_autocomplete)
     async def config_set(self, ctx, key: str.lower, *, value: str):
         """Set a configuration variable and its value."""
 
@@ -862,6 +1146,8 @@ class Utility(commands.Cog):
 
     @config.command(name="remove", aliases=["del", "delete"])
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(key="Configuration key to remove")
+    @app_commands.autocomplete(key=config_key_autocomplete)
     async def config_remove(self, ctx, *, key: str.lower):
         """Delete a set configuration variable."""
         keys = self.bot.config.public_keys
@@ -886,6 +1172,8 @@ class Utility(commands.Cog):
 
     @config.command(name="get")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(key="Configuration key to view")
+    @app_commands.autocomplete(key=config_key_autocomplete)
     async def config_get(self, ctx, *, key: str.lower = None):
         """
         Show the configuration variables that are currently set.
@@ -955,6 +1243,8 @@ class Utility(commands.Cog):
 
     @config.command(name="help", aliases=["info"])
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(key="Configuration key to get help for")
+    @app_commands.autocomplete(key=config_key_autocomplete)
     async def config_help(self, ctx, key: str.lower = None):
         """
         Show information on a specified configuration.
@@ -1021,8 +1311,10 @@ class Utility(commands.Cog):
         paginator.current = index
         await paginator.run()
 
-    @commands.group(aliases=["aliases"], invoke_without_command=True)
+    @commands.hybrid_group(aliases=["aliases"], invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.MODERATOR)
+    @app_commands.describe(name="Alias name to inspect")
+    @app_commands.autocomplete(name=alias_autocomplete)
     async def alias(self, ctx, *, name: str.lower = None):
         """
         Create shortcuts to bot commands.
@@ -1111,6 +1403,8 @@ class Utility(commands.Cog):
 
     @alias.command(name="raw")
     @checks.has_permissions(PermissionLevel.MODERATOR)
+    @app_commands.describe(name="Alias name to view raw content for")
+    @app_commands.autocomplete(name=alias_autocomplete)
     async def alias_raw(self, ctx, *, name: str.lower):
         """
         View the raw content of an alias.
@@ -1196,6 +1490,8 @@ class Utility(commands.Cog):
 
     @alias.command(name="add", aliases=["create", "make"])
     @checks.has_permissions(PermissionLevel.MODERATOR)
+    @app_commands.describe(name="Alias name to create", value="Command or snippet the alias points to")
+    @app_commands.autocomplete(name=alias_autocomplete)
     async def alias_add(self, ctx, name: str.lower, *, value):
         """
         Add an alias.
@@ -1245,6 +1541,8 @@ class Utility(commands.Cog):
 
     @alias.command(name="remove", aliases=["del", "delete"])
     @checks.has_permissions(PermissionLevel.MODERATOR)
+    @app_commands.describe(name="Alias name to remove")
+    @app_commands.autocomplete(name=alias_autocomplete)
     async def alias_remove(self, ctx, *, name: str.lower):
         """Remove an alias."""
 
@@ -1264,6 +1562,8 @@ class Utility(commands.Cog):
 
     @alias.command(name="edit")
     @checks.has_permissions(PermissionLevel.MODERATOR)
+    @app_commands.describe(name="Alias name to edit", value="New command or snippet target")
+    @app_commands.autocomplete(name=alias_autocomplete)
     async def alias_edit(self, ctx, name: str.lower, *, value):
         """
         Edit an alias.
@@ -1275,7 +1575,7 @@ class Utility(commands.Cog):
         embed = await self.make_alias(name, value, "Edited")
         return await ctx.send(embed=embed)
 
-    @commands.group(aliases=["perms"], invoke_without_command=True)
+    @commands.hybrid_group(aliases=["perms"], invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.OWNER)
     async def permissions(self, ctx):
         """
@@ -1330,6 +1630,14 @@ class Utility(commands.Cog):
 
     @permissions.command(name="override")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(
+        command_name="Command to override permission level for",
+        level_name="Permission level to assign",
+    )
+    @app_commands.autocomplete(
+        command_name=command_name_autocomplete,
+        level_name=permission_level_autocomplete,
+    )
     async def permissions_override(self, ctx, command_name: str.lower, *, level_name: str):
         """
         Change a permission level for a specific command.
@@ -1382,6 +1690,16 @@ class Utility(commands.Cog):
 
     @permissions.command(name="add", usage="[command/level] [name] [user/role]")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(
+        type_="Whether to add permission for a command or level",
+        name="Command name or permission level",
+        user_or_role="User or role to grant permission to",
+    )
+    @app_commands.autocomplete(
+        type_=permission_type_autocomplete,
+        name=permissions_name_autocomplete,
+        user_or_role=member_role_autocomplete,
+    )
     async def permissions_add(
         self,
         ctx,
@@ -1404,6 +1722,8 @@ class Utility(commands.Cog):
 
         Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
+        if ctx.interaction is not None:
+            user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
         if type_ not in {"command", "level"}:
             return await ctx.send_help(ctx.command)
@@ -1467,6 +1787,16 @@ class Utility(commands.Cog):
         usage="[command/level] [name] [user/role] or [override] [command name]",
     )
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(
+        type_="Whether to remove command, level, or override permission",
+        name="Command name or permission level",
+        user_or_role="User or role to revoke permission from",
+    )
+    @app_commands.autocomplete(
+        type_=permission_type_autocomplete,
+        name=permissions_name_autocomplete,
+        user_or_role=member_role_autocomplete,
+    )
     async def permissions_remove(
         self,
         ctx,
@@ -1491,6 +1821,9 @@ class Utility(commands.Cog):
 
         Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
+        if ctx.interaction is not None and user_or_role is not None:
+            user_or_role = await self._resolve_member_role(ctx, user_or_role)
+
         if type_ not in {"command", "level", "override"} or (type_ != "override" and user_or_role is None):
             return await ctx.send_help(ctx.command)
 
@@ -1635,6 +1968,14 @@ class Utility(commands.Cog):
 
     @permissions.command(name="get", usage="[@user] or [command/level/override] [name]")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(
+        user_or_role="User, role, or get mode (command/level/override)",
+        name="Command name or permission level when using a get mode",
+    )
+    @app_commands.autocomplete(
+        user_or_role=permissions_get_target_autocomplete,
+        name=permissions_name_autocomplete,
+    )
     async def permissions_get(
         self,
         ctx,
@@ -1668,6 +2009,8 @@ class Utility(commands.Cog):
 
         Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
+        if ctx.interaction is not None and user_or_role not in {"command", "level", "override"}:
+            user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
         if name is None and user_or_role not in {"command", "level", "override"}:
             value = str(self._verify_user_or_role(user_or_role))
@@ -1807,7 +2150,7 @@ class Utility(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         return await session.run()
 
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.OWNER)
     async def oauth(self, ctx):
         """
@@ -1819,12 +2162,19 @@ class Utility(commands.Cog):
 
     @oauth.command(name="whitelist")
     @checks.has_permissions(PermissionLevel.OWNER)
-    async def oauth_whitelist(self, ctx, target: Union[discord.Role, utils.User]):
+    @app_commands.describe(target="User or role to whitelist or un-whitelist")
+    @app_commands.autocomplete(target=member_role_autocomplete)
+    async def oauth_whitelist(self, ctx, target: Union[discord.Role, utils.User, str]):
         """
         Whitelist or un-whitelist a user or role to have access to logs.
 
         `target` may be a role ID, name, mention, user ID, name, or mention.
         """
+        if ctx.interaction is not None:
+            target = await self._resolve_member_role(ctx, target)
+            if isinstance(target, str):
+                raise commands.BadArgument(f'User or Role "{target}" not found')
+
         whitelisted = self.bot.config["oauth_whitelist"]
 
         # target.id is not int??
@@ -1872,7 +2222,7 @@ class Utility(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.OWNER)
     async def autotrigger(self, ctx):
         """Automatically trigger alias-like commands based on a certain keyword in the user's inital message"""
@@ -1880,6 +2230,8 @@ class Utility(commands.Cog):
 
     @autotrigger.command(name="add")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(keyword="Trigger keyword", command="Command or alias to run")
+    @app_commands.autocomplete(keyword=autotrigger_keyword_autocomplete)
     async def autotrigger_add(self, ctx, keyword, *, command):
         """Adds a trigger to automatically trigger an alias-like command"""
         if keyword in self.bot.auto_triggers:
@@ -1923,6 +2275,8 @@ class Utility(commands.Cog):
 
     @autotrigger.command(name="edit")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(keyword="Trigger keyword to edit", command="New command or alias to run")
+    @app_commands.autocomplete(keyword=autotrigger_keyword_autocomplete)
     async def autotrigger_edit(self, ctx, keyword, *, command):
         """Edits a pre-existing trigger to automatically trigger an alias-like command"""
         if keyword not in self.bot.auto_triggers:
@@ -1962,6 +2316,8 @@ class Utility(commands.Cog):
 
     @autotrigger.command(name="remove")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(keyword="Trigger keyword to remove")
+    @app_commands.autocomplete(keyword=autotrigger_keyword_autocomplete)
     async def autotrigger_remove(self, ctx, keyword):
         """Removes a trigger to automatically trigger an alias-like command"""
         try:
@@ -2036,7 +2392,7 @@ class Utility(commands.Cog):
 
         await EmbedPaginatorSession(ctx, *embeds).run()
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.OWNER)
     @checks.github_token_required()
     @trigger_typing
@@ -2057,11 +2413,12 @@ class Utility(commands.Cog):
         else:
             await ctx.send(embed=discord.Embed(title="Invalid Github Token", color=self.bot.error_color))
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.OWNER)
     @checks.github_token_required(ignore_if_not_heroku=True)
     @checks.updates_enabled()
     @trigger_typing
+    @app_commands.describe(flag='Use "force" to update even when already up to date')
     async def update(self, ctx, *, flag: str = ""):
         """
         Update Modmail.

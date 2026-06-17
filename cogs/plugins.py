@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import sys
-import typing
 import zipfile
 from difflib import get_close_matches
 from importlib import invalidate_caches
@@ -14,10 +13,12 @@ from site import USER_SITE
 from subprocess import PIPE
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from packaging.version import Version
 
 from core import checks
+from core.autocomplete import plugin_name_autocomplete
 from core.models import PermissionLevel, getLogger
 from core.paginator import EmbedPaginatorSession
 from core.utils import trigger_typing, truncate, safe_typing
@@ -122,12 +123,30 @@ class Plugins(commands.Cog):
         self.loaded_plugins = set()
         self._ready_event = asyncio.Event()
 
+    def _guilds(self) -> list[discord.Object]:
+        """Return guild scopes for slash command registration."""
+        guilds = []
+        if self.bot.guild_id:
+            guilds.append(discord.Object(id=self.bot.guild_id))
+        if self.bot.using_multiple_server_setup:
+            modmail_guild_id = self.bot.config.get("modmail_guild_id")
+            if modmail_guild_id is not None:
+                try:
+                    guilds.append(discord.Object(id=int(modmail_guild_id)))
+                except (TypeError, ValueError):
+                    pass
+        return guilds
+
     async def cog_load(self):
         await self.populate_registry()
         if self.bot.config.get("enable_plugins"):
             await self.initial_load_plugins()
         else:
             logger.info("Plugins not loaded since ENABLE_PLUGINS=false.")
+        guilds = self._guilds()
+        if guilds:
+            for command in self.walk_app_commands():
+                command.guilds = guilds
 
     async def populate_registry(self):
         url = "https://raw.githubusercontent.com/modmail-dev/modmail/master/plugins/registry.json"
@@ -339,7 +358,7 @@ class Plugins(commands.Cog):
                 return
         return plugin
 
-    @commands.group(aliases=["plugin"], invoke_without_command=True)
+    @commands.hybrid_group(aliases=["plugin"], invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.OWNER)
     async def plugins(self, ctx):
         """
@@ -351,6 +370,10 @@ class Plugins(commands.Cog):
     @plugins.command(name="add", aliases=["install", "load"])
     @checks.has_permissions(PermissionLevel.OWNER)
     @trigger_typing
+    @app_commands.describe(
+        plugin_name="Registry name or GitHub reference (user/repo/name[@branch], local/name)"
+    )
+    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
     async def plugins_add(self, ctx, *, plugin_name: str):
         """
         Install a new plugin for the bot.
@@ -439,6 +462,10 @@ class Plugins(commands.Cog):
 
     @plugins.command(name="remove", aliases=["del", "delete"])
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(
+        plugin_name="Registry name or GitHub reference (user/repo/name[@branch], local/name)"
+    )
+    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
     async def plugins_remove(self, ctx, *, plugin_name: str):
         """
         Remove an installed plugin of the bot.
@@ -521,6 +548,10 @@ class Plugins(commands.Cog):
 
     @plugins.command(name="update")
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(
+        plugin_name="Registry name or GitHub reference; leave empty to update all installed plugins"
+    )
+    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
     async def plugins_update(self, ctx, *, plugin_name: str = None):
         """
         Update a plugin for the bot.
@@ -635,7 +666,9 @@ class Plugins(commands.Cog):
 
     @plugins.group(invoke_without_command=True, name="registry", aliases=["list", "info"])
     @checks.has_permissions(PermissionLevel.OWNER)
-    async def plugins_registry(self, ctx, *, plugin_name: typing.Union[int, str] = None):
+    @app_commands.describe(plugin_name="Plugin name or page number in the registry")
+    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
+    async def plugins_registry(self, ctx, *, plugin_name: str = None):
         """
         Shows a list of all approved plugins.
 
@@ -659,8 +692,8 @@ class Plugins(commands.Cog):
             await ctx.send(embed=embed)
             return
 
-        if isinstance(plugin_name, int):
-            index = plugin_name - 1
+        if plugin_name is not None and plugin_name.isdigit():
+            index = int(plugin_name) - 1
             if index < 0:
                 index = 0
             if index >= len(registry):

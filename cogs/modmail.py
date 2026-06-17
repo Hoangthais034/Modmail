@@ -6,8 +6,10 @@ from typing import Optional, Union, List, Tuple, Literal
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ext import tasks
+from discord.ext.commands import parameter
 from discord.ext.commands.view import StringView
 from discord.ext.commands.cooldowns import BucketType
 from discord.role import Role
@@ -16,6 +18,14 @@ from discord.utils import escape_markdown
 from dateutil import parser
 
 from core import checks
+from core.autocomplete import (
+    category_autocomplete,
+    guild_member_autocomplete,
+    guild_role_autocomplete,
+    log_key_autocomplete,
+    log_recipient_autocomplete,
+    snippet_autocomplete,
+)
 from core.models import DMDisabled, PermissionLevel, SimilarCategoryConverter, getLogger
 from core.paginator import EmbedPaginatorSession
 from core.thread import Thread
@@ -23,6 +33,33 @@ from core.time import UserFriendlyTime, human_timedelta
 from core.utils import *
 
 logger = getLogger(__name__)
+
+
+async def member_role_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest guild members and roles for slash parameters."""
+    members = await guild_member_autocomplete(interaction, current)
+    roles = await guild_role_autocomplete(interaction, current)
+    return (members + roles)[:25]
+
+
+async def notify_target_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest members, roles, here, and everyone for notify-style commands."""
+    choices = []
+    current_lower = (current or "").casefold()
+    if not current_lower or "here".startswith(current_lower) or current_lower in ("here", "@here"):
+        choices.append(app_commands.Choice(name="here", value="here"))
+    if (
+        not current_lower
+        or "everyone".startswith(current_lower)
+        or current_lower in ("everyone", "@everyone")
+    ):
+        choices.append(app_commands.Choice(name="everyone", value="everyone"))
+    choices.extend(await member_role_autocomplete(interaction, current))
+    return choices[:25]
 
 
 class Modmail(commands.Cog):
@@ -86,33 +123,89 @@ class Modmail(commands.Cog):
                 logging.error(f"Error in auto_unsnooze_task: {e}")
             await asyncio.sleep(10)
 
-    def _resolve_user(self, user_str):
-        """Helper to resolve a user from mention, ID, or username."""
-        import re
+    def _guilds(self) -> list[discord.Object]:
+        """Return guild scopes for slash command registration."""
+        guilds = []
+        if self.bot.guild_id:
+            guilds.append(discord.Object(id=self.bot.guild_id))
+        if self.bot.using_multiple_server_setup:
+            modmail_guild_id = self.bot.config.get("modmail_guild_id")
+            if modmail_guild_id is not None:
+                try:
+                    guilds.append(discord.Object(id=int(modmail_guild_id)))
+                except (TypeError, ValueError):
+                    pass
+        return guilds
 
-        if not user_str:
+    def _collect_users(self, *users) -> list:
+        """Gather optional slash user parameters into a list."""
+        return [user for user in users if user is not None]
+
+    def _get_prefix_rest(self, ctx) -> str:
+        """Return the unparsed argument string from a prefix command message."""
+        message = ctx.message.content
+        prefix = ctx.prefix
+        if isinstance(prefix, list):
+            prefix = next((p for p in prefix if message.startswith(p)), "")
+        if prefix and message.startswith(prefix):
+            rest = message[len(prefix) :].lstrip()
+        else:
+            rest = message
+        for part in ctx.command.qualified_name.split():
+            if rest.lower().startswith(part.lower()):
+                rest = rest[len(part) :].lstrip()
+        return rest
+
+    async def _resolve_notify_target(self, ctx, user_or_role):
+        """Resolve a notify target from mention, ID, member, role, or literal."""
+        if user_or_role is None:
             return None
-        if user_str.isdigit():
-            return int(user_str)
-        match = re.match(r"<@!?(\d+)>", user_str)
-        if match:
-            return int(match.group(1))
-        return None
+        if isinstance(user_or_role, (discord.Member, discord.Role)):
+            return user_or_role
+        if isinstance(user_or_role, User):
+            guild = ctx.guild or self.bot.modmail_guild
+            if guild is not None:
+                member = guild.get_member(user_or_role.id)
+                if member is not None:
+                    return member
+            return user_or_role
+        if isinstance(user_or_role, str):
+            lowered = user_or_role.casefold()
+            if lowered in ("here", "everyone", "@here", "@everyone"):
+                return lowered.lstrip("@")
+            guild = ctx.guild or self.bot.modmail_guild
+            if guild is not None and user_or_role.isdigit():
+                member = guild.get_member(int(user_or_role))
+                if member is not None:
+                    return member
+                role = guild.get_role(int(user_or_role))
+                if role is not None:
+                    return role
+            try:
+                return await commands.MemberConverter().convert(ctx, user_or_role)
+            except commands.BadArgument:
+                pass
+            try:
+                return await commands.RoleConverter().convert(ctx, user_or_role)
+            except commands.BadArgument:
+                pass
+        return user_or_role
 
-    def _resolve_user(self, user_str):
-        """Helper to resolve a user from mention, ID, or username."""
-        import re
+    def _expand_users_arg(self, ctx, users_arg, silent=False):
+        """Expand member/role arguments and detect silent flag from prefix or slash input."""
+        effective_silent = silent
+        users = []
+        for u in users_arg:
+            if isinstance(u, str):
+                if "silent" in u or "silently" in u:
+                    effective_silent = True
+            elif isinstance(u, discord.Role):
+                users += u.members
+            elif isinstance(u, discord.Member):
+                users.append(u)
+        return users, effective_silent
 
-        if not user_str:
-            return None
-        if user_str.isdigit():
-            return int(user_str)
-        match = re.match(r"<@!?(\d+)>", user_str)
-        if match:
-            return int(match.group(1))
-        return None
-
-    @commands.command()
+    @commands.hybrid_command()
     @trigger_typing
     @checks.has_permissions(PermissionLevel.OWNER)
     async def setup(self, ctx):
@@ -201,9 +294,11 @@ class Modmail(commands.Cog):
             for owner_id in self.bot.bot_owner_ids:
                 await self.bot.update_perms(PermissionLevel.OWNER, owner_id)
 
-    @commands.group(aliases=["snippets"], invoke_without_command=True)
+    @commands.hybrid_group(aliases=["snippets"], invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def snippet(self, ctx, *, name: str.lower = None):
+    @app_commands.describe(name="Snippet name to view")
+    @app_commands.autocomplete(name=snippet_autocomplete)
+    async def snippet(self, ctx, name: str = None):
         """
         Create pre-defined messages for use in threads.
 
@@ -226,6 +321,7 @@ class Modmail(commands.Cog):
         """
 
         if name is not None:
+            name = name.lower()
             if name == "compact":
                 embeds = []
 
@@ -241,7 +337,7 @@ class Modmail(commands.Cog):
                 await session.run()
                 return
 
-            snippet_name = self.bot._resolve_snippet(name)
+            snippet_name = self.bot._resolve_snippet(name.lower())
 
             if snippet_name is None:
                 embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
@@ -280,11 +376,13 @@ class Modmail(commands.Cog):
 
     @snippet.command(name="raw")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def snippet_raw(self, ctx, *, name: str.lower):
+    @app_commands.describe(name="Snippet name")
+    @app_commands.autocomplete(name=snippet_autocomplete)
+    async def snippet_raw(self, ctx, *, name: str):
         """
         View the raw content of a snippet.
         """
-        snippet_name = self.bot._resolve_snippet(name)
+        snippet_name = self.bot._resolve_snippet(name.lower())
         if snippet_name is None:
             embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
         else:
@@ -405,8 +503,11 @@ class Modmail(commands.Cog):
 
     @snippet.command(name="remove", aliases=["del", "delete"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def snippet_remove(self, ctx, *, name: str.lower):
+    @app_commands.describe(name="Snippet name to remove")
+    @app_commands.autocomplete(name=snippet_autocomplete)
+    async def snippet_remove(self, ctx, *, name: str):
         """Remove a snippet."""
+        name = name.lower()
         if name in self.bot.snippets:
             deleted_aliases, edited_aliases = self._fix_aliases(name)
 
@@ -459,7 +560,9 @@ class Modmail(commands.Cog):
 
     @snippet.command(name="edit")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def snippet_edit(self, ctx, name: str.lower, *, value):
+    @app_commands.describe(name="Snippet name to edit", value="New snippet content")
+    @app_commands.autocomplete(name=snippet_autocomplete)
+    async def snippet_edit(self, ctx, name: str, *, value):
         """
         Edit a snippet.
 
@@ -467,6 +570,7 @@ class Modmail(commands.Cog):
         {prefix}snippet edit "two word" this is a new two word snippet.
         ```
         """
+        name = name.lower()
         if name in self.bot.snippets:
             self.bot.snippets[name] = value
             await self.bot.config.update()
@@ -480,47 +584,59 @@ class Modmail(commands.Cog):
             embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
         await ctx.send(embed=embed)
 
-    @commands.command(usage="<category> [options]")
+    @commands.hybrid_command(usage="<category> [options]")
     @checks.has_permissions(PermissionLevel.MODERATOR)
     @checks.thread_only()
-    async def move(self, ctx, *, arguments):
+    @app_commands.describe(category="Category to move the thread to", silent="Move without notifying the recipient")
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def move(
+        self,
+        ctx,
+        category: SimilarCategoryConverter = None,
+        silent: bool = False,
+        *,
+        arguments: str = parameter(default="", include_in_app_command=False),
+    ):
         """
         Move a thread to another category.
 
         `category` may be a category ID, mention, or name.
         `options` is a string which takes in arguments on how to perform the move. Ex: "silently"
         """
-        split_args = arguments.strip('"').split(" ")
-        category = None
+        if ctx.interaction is None:
+            arguments = self._get_prefix_rest(ctx)
+            if not arguments:
+                raise commands.MissingRequiredArgument(DummyParam("category"))
+            split_args = arguments.strip('"').split(" ")
+            category = None
+            i = 0
 
-        # manually parse arguments, consumes as much of args as possible for category
-        for i in range(len(split_args)):
-            try:
-                if i == 0:
-                    fmt = arguments
+            for i in range(len(split_args)):
+                try:
+                    if i == 0:
+                        fmt = arguments
+                    else:
+                        fmt = " ".join(split_args[:-i])
+
+                    category = await SimilarCategoryConverter().convert(ctx, fmt)
+                except commands.BadArgument:
+                    if i == len(split_args) - 1:
+                        raise
                 else:
-                    fmt = " ".join(split_args[:-i])
+                    break
 
-                category = await SimilarCategoryConverter().convert(ctx, fmt)
-            except commands.BadArgument:
-                if i == len(split_args) - 1:
-                    # last one
-                    raise
-                pass
-            else:
-                break
+            if not category:
+                raise commands.ChannelNotFound(arguments)
 
-        if not category:
-            raise commands.ChannelNotFound(arguments)
-
-        options = " ".join(arguments.split(" ")[-i:])
+            options = " ".join(arguments.split(" ")[-i:])
+            silent = False
+            if options:
+                silent_words = ["silent", "silently"]
+                silent = any(word in silent_words for word in options.split())
+        elif category is None:
+            raise commands.MissingRequiredArgument(DummyParam("category"))
 
         thread = ctx.thread
-        silent = False
-
-        if options:
-            silent_words = ["silent", "silently"]
-            silent = any(word in silent_words for word in options.split())
 
         await thread.channel.move(
             category=category,
@@ -568,13 +684,22 @@ class Modmail(commands.Cog):
         if thread and ctx.channel == thread.channel:
             await thread.channel.send(embed=embed)
 
-    @commands.command(usage="[after] [close message]")
+    @commands.hybrid_command(usage="[after] [close message]")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
+    @app_commands.describe(
+        silent="Close without sending a message to the recipient",
+        cancel="Cancel a scheduled close",
+        after="When to close (e.g. 2h, in 30m) and optional close message",
+    )
     async def close(
         self,
         ctx,
-        option: Optional[Literal["silent", "silently", "cancel"]] = "",
+        option: Optional[Literal["silent", "silently", "cancel"]] = parameter(
+            default="", include_in_app_command=False
+        ),
+        silent: bool = False,
+        cancel: bool = False,
         *,
         after: UserFriendlyTime = None,
     ):
@@ -599,9 +724,11 @@ class Modmail(commands.Cog):
 
         thread = ctx.thread
 
+        if ctx.interaction is None:
+            silent = any(x == option for x in {"silent", "silently"})
+            cancel = option == "cancel"
+
         close_after = (after.dt - after.now).total_seconds() if after else 0
-        silent = any(x == option for x in {"silent", "silently"})
-        cancel = option == "cancel"
 
         if cancel:
             if thread.close_task is not None or thread.auto_close_task is not None:
@@ -638,10 +765,12 @@ class Modmail(commands.Cog):
             mention = "@" + user_or_role.lstrip("@")
         return mention
 
-    @commands.command(aliases=["alert"])
+    @commands.hybrid_command(aliases=["alert"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
-    async def notify(self, ctx, *, user_or_role: Union[discord.Role, User, str.lower, None] = None):
+    @app_commands.describe(user_or_role="User or role to notify (default: yourself)")
+    @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
+    async def notify(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
         """
         Notify a user or role when the next thread message received.
 
@@ -651,6 +780,7 @@ class Modmail(commands.Cog):
         `@here` and `@everyone` can be substituted with `here` and `everyone`.
         `user_or_role` may be a user ID, mention, name. role ID, mention, name, "everyone", or "here".
         """
+        user_or_role = await self._resolve_notify_target(ctx, user_or_role)
         mention = self.parse_user_or_role(ctx, user_or_role)
         if mention is None:
             raise commands.BadArgument(f"{user_or_role} is not a valid user or role.")
@@ -676,10 +806,12 @@ class Modmail(commands.Cog):
             )
         return await ctx.send(embed=embed)
 
-    @commands.command(aliases=["unalert"])
+    @commands.hybrid_command(aliases=["unalert"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
-    async def unnotify(self, ctx, *, user_or_role: Union[discord.Role, User, str.lower, None] = None):
+    @app_commands.describe(user_or_role="User or role to un-notify (default: yourself)")
+    @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
+    async def unnotify(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
         """
         Un-notify a user, role, or yourself from a thread.
 
@@ -687,6 +819,7 @@ class Modmail(commands.Cog):
         `@here` and `@everyone` can be substituted with `here` and `everyone`.
         `user_or_role` may be a user ID, mention, name, role ID, mention, name, "everyone", or "here".
         """
+        user_or_role = await self._resolve_notify_target(ctx, user_or_role)
         mention = self.parse_user_or_role(ctx, user_or_role)
         if mention is None:
             mention = f"`{user_or_role}`"
@@ -712,10 +845,12 @@ class Modmail(commands.Cog):
             )
         return await ctx.send(embed=embed)
 
-    @commands.command(aliases=["sub"])
+    @commands.hybrid_command(aliases=["sub"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
-    async def subscribe(self, ctx, *, user_or_role: Union[discord.Role, User, str.lower, None] = None):
+    @app_commands.describe(user_or_role="User or role to subscribe (default: yourself)")
+    @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
+    async def subscribe(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
         """
         Notify a user, role, or yourself for every thread message received.
 
@@ -725,6 +860,7 @@ class Modmail(commands.Cog):
         `@here` and `@everyone` can be substituted with `here` and `everyone`.
         `user_or_role` may be a user ID, mention, name, role ID, mention, name, "everyone", or "here".
         """
+        user_or_role = await self._resolve_notify_target(ctx, user_or_role)
         mention = self.parse_user_or_role(ctx, user_or_role)
         if mention is None:
             raise commands.BadArgument(f"{user_or_role} is not a valid user or role.")
@@ -750,10 +886,12 @@ class Modmail(commands.Cog):
             )
         return await ctx.send(embed=embed)
 
-    @commands.command(aliases=["unsub"])
+    @commands.hybrid_command(aliases=["unsub"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
-    async def unsubscribe(self, ctx, *, user_or_role: Union[discord.Role, User, str.lower, None] = None):
+    @app_commands.describe(user_or_role="User or role to unsubscribe (default: yourself)")
+    @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
+    async def unsubscribe(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
         """
         Unsubscribe a user, role, or yourself from a thread.
 
@@ -761,6 +899,7 @@ class Modmail(commands.Cog):
         `@here` and `@everyone` can be substituted with `here` and `everyone`.
         `user_or_role` may be a user ID, mention, name, role ID, mention, name, "everyone", or "here".
         """
+        user_or_role = await self._resolve_notify_target(ctx, user_or_role)
         mention = self.parse_user_or_role(ctx, user_or_role)
         if mention is None:
             mention = f"`{user_or_role}`"
@@ -786,7 +925,7 @@ class Modmail(commands.Cog):
             )
         return await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def nsfw(self, ctx):
@@ -795,7 +934,7 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def sfw(self, ctx):
@@ -804,9 +943,10 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
+    @app_commands.describe(message_id="Message ID to get the link for")
     async def msglink(self, ctx, message_id: int):
         """Retrieves the link to a message in the current thread."""
         found = False
@@ -826,7 +966,7 @@ class Modmail(commands.Cog):
             embed = discord.Embed(color=self.bot.main_color, description=message.jump_url)
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def loglink(self, ctx):
@@ -883,10 +1023,11 @@ class Modmail(commands.Cog):
             embeds.append(embed)
         return embeds
 
-    @commands.command(cooldown_after_parsing=True)
+    @commands.hybrid_command(cooldown_after_parsing=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     @commands.cooldown(1, 600, BucketType.channel)
+    @app_commands.describe(name="New thread title")
     async def title(self, ctx, *, name: str):
         """Sets title for a thread"""
         await ctx.thread.set_title(name)
@@ -894,25 +1035,37 @@ class Modmail(commands.Cog):
         await ctx.message.pin()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
+    @commands.hybrid_command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     @commands.cooldown(1, 600, BucketType.channel)
-    async def adduser(self, ctx, *users_arg: Union[discord.Member, discord.Role, str]):
+    @app_commands.describe(
+        user1="First user or role to add",
+        user2="Second user or role to add",
+        user3="Third user or role to add",
+        user4="Fourth user or role to add",
+        user5="Fifth user or role to add",
+        silent="Add users without notifying them",
+    )
+    @app_commands.autocomplete(user1=member_role_autocomplete, user2=member_role_autocomplete, user3=member_role_autocomplete, user4=member_role_autocomplete, user5=member_role_autocomplete)
+    async def adduser(
+        self,
+        ctx,
+        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
+        user1: Optional[Union[discord.Member, discord.Role]] = None,
+        user2: Optional[Union[discord.Member, discord.Role]] = None,
+        user3: Optional[Union[discord.Member, discord.Role]] = None,
+        user4: Optional[Union[discord.Member, discord.Role]] = None,
+        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        silent: bool = False,
+    ):
         """Adds a user to a modmail thread
 
         `options` can be `silent` or `silently`.
         """
-        silent = False
-        users = []
-        for u in users_arg:
-            if isinstance(u, str):
-                if "silent" in u or "silently" in u:
-                    silent = True
-            elif isinstance(u, discord.Role):
-                users += u.members
-            elif isinstance(u, discord.Member):
-                users.append(u)
+        if ctx.interaction is not None:
+            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
             # u is a discord.Member
@@ -997,25 +1150,37 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
+    @commands.hybrid_command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     @commands.cooldown(1, 600, BucketType.channel)
-    async def removeuser(self, ctx, *users_arg: Union[discord.Member, discord.Role, str]):
+    @app_commands.describe(
+        user1="First user or role to remove",
+        user2="Second user or role to remove",
+        user3="Third user or role to remove",
+        user4="Fourth user or role to remove",
+        user5="Fifth user or role to remove",
+        silent="Remove users without notifying them",
+    )
+    @app_commands.autocomplete(user1=member_role_autocomplete, user2=member_role_autocomplete, user3=member_role_autocomplete, user4=member_role_autocomplete, user5=member_role_autocomplete)
+    async def removeuser(
+        self,
+        ctx,
+        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
+        user1: Optional[Union[discord.Member, discord.Role]] = None,
+        user2: Optional[Union[discord.Member, discord.Role]] = None,
+        user3: Optional[Union[discord.Member, discord.Role]] = None,
+        user4: Optional[Union[discord.Member, discord.Role]] = None,
+        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        silent: bool = False,
+    ):
         """Removes a user from a modmail thread
 
         `options` can be `silent` or `silently`.
         """
-        silent = False
-        users = []
-        for u in users_arg:
-            if isinstance(u, str):
-                if "silent" in u or "silently" in u:
-                    silent = True
-            elif isinstance(u, discord.Role):
-                users += u.members
-            elif isinstance(u, discord.Member):
-                users.append(u)
+        if ctx.interaction is not None:
+            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
             # u is a discord.Member
@@ -1096,25 +1261,37 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
+    @commands.hybrid_command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     @commands.cooldown(1, 600, BucketType.channel)
-    async def anonadduser(self, ctx, *users_arg: Union[discord.Member, discord.Role, str]):
+    @app_commands.describe(
+        user1="First user or role to add",
+        user2="Second user or role to add",
+        user3="Third user or role to add",
+        user4="Fourth user or role to add",
+        user5="Fifth user or role to add",
+        silent="Add users without notifying them",
+    )
+    @app_commands.autocomplete(user1=member_role_autocomplete, user2=member_role_autocomplete, user3=member_role_autocomplete, user4=member_role_autocomplete, user5=member_role_autocomplete)
+    async def anonadduser(
+        self,
+        ctx,
+        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
+        user1: Optional[Union[discord.Member, discord.Role]] = None,
+        user2: Optional[Union[discord.Member, discord.Role]] = None,
+        user3: Optional[Union[discord.Member, discord.Role]] = None,
+        user4: Optional[Union[discord.Member, discord.Role]] = None,
+        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        silent: bool = False,
+    ):
         """Adds a user to a modmail thread anonymously
 
         `options` can be `silent` or `silently`.
         """
-        silent = False
-        users = []
-        for u in users_arg:
-            if isinstance(u, str):
-                if "silent" in u or "silently" in u:
-                    silent = True
-            elif isinstance(u, discord.Role):
-                users += u.members
-            elif isinstance(u, discord.Member):
-                users.append(u)
+        if ctx.interaction is not None:
+            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
             curr_thread = await self.bot.threads.find(recipient=u)
@@ -1192,25 +1369,37 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
+    @commands.hybrid_command(usage="<users_or_roles...> [options]", cooldown_after_parsing=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     @commands.cooldown(1, 600, BucketType.channel)
-    async def anonremoveuser(self, ctx, *users_arg: Union[discord.Member, discord.Role, str]):
+    @app_commands.describe(
+        user1="First user or role to remove",
+        user2="Second user or role to remove",
+        user3="Third user or role to remove",
+        user4="Fourth user or role to remove",
+        user5="Fifth user or role to remove",
+        silent="Remove users without notifying them",
+    )
+    @app_commands.autocomplete(user1=member_role_autocomplete, user2=member_role_autocomplete, user3=member_role_autocomplete, user4=member_role_autocomplete, user5=member_role_autocomplete)
+    async def anonremoveuser(
+        self,
+        ctx,
+        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
+        user1: Optional[Union[discord.Member, discord.Role]] = None,
+        user2: Optional[Union[discord.Member, discord.Role]] = None,
+        user3: Optional[Union[discord.Member, discord.Role]] = None,
+        user4: Optional[Union[discord.Member, discord.Role]] = None,
+        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        silent: bool = False,
+    ):
         """Removes a user from a modmail thread anonymously
 
         `options` can be `silent` or `silently`.
         """
-        silent = False
-        users = []
-        for u in users_arg:
-            if isinstance(u, str):
-                if "silent" in u or "silently" in u:
-                    silent = True
-            elif isinstance(u, discord.Role):
-                users += u.members
-            elif isinstance(u, discord.Member):
-                users.append(u)
+        if ctx.interaction is not None:
+            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
             curr_thread = await self.bot.threads.find(recipient=u)
@@ -1283,9 +1472,11 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def logs(self, ctx, *, user: User = None):
+    @app_commands.describe(user="Member to view logs for")
+    @app_commands.autocomplete(user=log_recipient_autocomplete)
+    async def logs(self, ctx, user: User = None):
         """
         Get previous Modmail thread logs of a member.
 
@@ -1324,7 +1515,9 @@ class Modmail(commands.Cog):
 
     @logs.command(name="closed-by", aliases=["closeby"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def logs_closed_by(self, ctx, *, user: User = None):
+    @app_commands.describe(user="Staff member who closed the logs")
+    @app_commands.autocomplete(user=guild_member_autocomplete)
+    async def logs_closed_by(self, ctx, user: User = None):
         """
         Get all logs closed by the specified user.
 
@@ -1348,6 +1541,8 @@ class Modmail(commands.Cog):
 
     @logs.command(name="key", aliases=["id"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @app_commands.describe(key="Log key to look up")
+    @app_commands.autocomplete(key=log_key_autocomplete)
     async def logs_key(self, ctx, key: str):
         """
         Get the log link for the specified log key.
@@ -1370,6 +1565,8 @@ class Modmail(commands.Cog):
 
     @logs.command(name="delete", aliases=["wipe"])
     @checks.has_permissions(PermissionLevel.OWNER)
+    @app_commands.describe(key_or_link="Log key or log URL to delete")
+    @app_commands.autocomplete(key_or_link=log_key_autocomplete)
     async def logs_delete(self, ctx, key_or_link: str):
         """
         Wipe a log entry from the database.
@@ -1395,7 +1592,9 @@ class Modmail(commands.Cog):
 
     @logs.command(name="responded")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def logs_responded(self, ctx, *, user: User = None):
+    @app_commands.describe(user="Staff member who responded in the logs")
+    @app_commands.autocomplete(user=guild_member_autocomplete)
+    async def logs_responded(self, ctx, user: User = None):
         """
         Get all logs where the specified user has responded at least once.
 
@@ -1420,7 +1619,8 @@ class Modmail(commands.Cog):
 
     @logs.command(name="search", aliases=["find"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def logs_search(self, ctx, limit: Optional[int] = None, *, query):
+    @app_commands.describe(limit="Maximum number of logs to return", query="Text to search for in log messages")
+    async def logs_search(self, ctx, limit: Optional[int] = None, query: str = ""):
         """
         Retrieve all logs that contain messages with your query.
 
@@ -1429,6 +1629,9 @@ class Modmail(commands.Cog):
 
         async with safe_typing(ctx):
             pass
+
+        if not query:
+            raise commands.MissingRequiredArgument(DummyParam("query"))
 
         entries = await self.bot.api.search_by_text(query, limit)
 
@@ -1444,7 +1647,7 @@ class Modmail(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def reply(self, ctx, *, msg: str = ""):
@@ -1460,7 +1663,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg)
 
-    @commands.command(aliases=["formatreply"])
+    @commands.hybrid_command(aliases=["formatreply"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def freply(self, ctx, *, msg: str = ""):
@@ -1486,7 +1689,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg)
 
-    @commands.command(aliases=["formatanonreply"])
+    @commands.hybrid_command(aliases=["formatanonreply"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def fareply(self, ctx, *, msg: str = ""):
@@ -1512,7 +1715,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg, anonymous=True)
 
-    @commands.command(aliases=["formatplainreply"])
+    @commands.hybrid_command(aliases=["formatplainreply"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def fpreply(self, ctx, *, msg: str = ""):
@@ -1538,7 +1741,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg, plain=True)
 
-    @commands.command(aliases=["formatplainanonreply"])
+    @commands.hybrid_command(aliases=["formatplainanonreply"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def fpareply(self, ctx, *, msg: str = ""):
@@ -1564,7 +1767,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg, anonymous=True, plain=True)
 
-    @commands.command(aliases=["anonreply", "anonymousreply"])
+    @commands.hybrid_command(aliases=["anonreply", "anonymousreply"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def areply(self, ctx, *, msg: str = ""):
@@ -1582,7 +1785,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg, anonymous=True)
 
-    @commands.command(aliases=["plainreply"])
+    @commands.hybrid_command(aliases=["plainreply"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def preply(self, ctx, *, msg: str = ""):
@@ -1597,7 +1800,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg, plain=True)
 
-    @commands.command(aliases=["plainanonreply", "plainanonymousreply"])
+    @commands.hybrid_command(aliases=["plainanonreply", "plainanonymousreply"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def pareply(self, ctx, *, msg: str = ""):
@@ -1612,7 +1815,7 @@ class Modmail(commands.Cog):
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg, anonymous=True, plain=True)
 
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def note(self, ctx, *, msg: str = ""):
@@ -1653,9 +1856,10 @@ class Modmail(commands.Cog):
         except (discord.Forbidden, discord.NotFound) as e:
             logger.debug(f"Failed to delete note command message: {e}")
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
+    @app_commands.describe(message_id="Message ID to edit (defaults to last staff message)", message="New message content")
     async def edit(self, ctx, message_id: Optional[int] = None, *, message: str):
         """
         Edit a message that was sent using the reply or anonreply command.
@@ -1681,7 +1885,7 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.REGULAR)
     async def selfcontact(self, ctx):
         """Creates a thread with yourself"""
@@ -1708,14 +1912,31 @@ class Modmail(commands.Cog):
                 await ctx.send(embed=embed, delete_after=10)
                 return
 
-        await ctx.invoke(self.contact, users=[ctx.author])
+        await ctx.invoke(self.contact, users_arg=[ctx.author])
 
-    @commands.command(usage="<user> [category] [options]")
+    @commands.hybrid_command(usage="<user> [category] [options]")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @app_commands.describe(
+        user1="First user to contact",
+        user2="Second user for a group thread",
+        user3="Third user for a group thread",
+        user4="Fourth user for a group thread",
+        user5="Fifth user for a group thread",
+        category="Category to create the thread in",
+        silent="Create the thread without notifying users",
+    )
+    @app_commands.autocomplete(
+        user1=member_role_autocomplete,
+        user2=member_role_autocomplete,
+        user3=member_role_autocomplete,
+        user4=member_role_autocomplete,
+        user5=member_role_autocomplete,
+        category=category_autocomplete,
+    )
     async def contact(
         self,
         ctx,
-        users: commands.Greedy[
+        *users_arg: commands.Greedy[
             Union[
                 Literal["silent", "silently"],
                 discord.Member,
@@ -1723,9 +1944,14 @@ class Modmail(commands.Cog):
                 discord.Role,
             ]
         ],
-        *,
+        user1: Optional[Union[discord.Member, discord.User]] = None,
+        user2: Optional[Union[discord.Member, discord.User]] = None,
+        user3: Optional[Union[discord.Member, discord.User]] = None,
+        user4: Optional[Union[discord.Member, discord.User]] = None,
+        user5: Optional[Union[discord.Member, discord.User]] = None,
         category: SimilarCategoryConverter = None,
-        manual_trigger=True,
+        silent: bool = False,
+        manual_trigger: bool = parameter(default=True, include_in_app_command=False),
     ):
         """
         Create a thread with a specified member.
@@ -1738,7 +1964,14 @@ class Modmail(commands.Cog):
         A maximum of 5 users are allowed.
         `options` can be `silent` or `silently`.
         """
-        silent = any(x in users for x in ("silent", "silently"))
+        if ctx.interaction is not None:
+            users = self._collect_users(user1, user2, user3, user4, user5)
+        else:
+            users = list(users_arg)
+
+        if ctx.interaction is None and any(x in users for x in ("silent", "silently")):
+            silent = True
+
         if silent:
             try:
                 users.remove("silent")
@@ -1892,7 +2125,7 @@ class Modmail(commands.Cog):
             except (discord.Forbidden, discord.NotFound):
                 pass
 
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.MODERATOR)
     @trigger_typing
     async def blocked(self, ctx):
@@ -1992,7 +2225,9 @@ class Modmail(commands.Cog):
     @blocked.command(name="whitelist")
     @checks.has_permissions(PermissionLevel.MODERATOR)
     @trigger_typing
-    async def blocked_whitelist(self, ctx, *, user: User = None):
+    @app_commands.describe(user="User to whitelist or un-whitelist from blocking")
+    @app_commands.autocomplete(user=log_recipient_autocomplete)
+    async def blocked_whitelist(self, ctx, user: User = None):
         """
         Whitelist or un-whitelist a user from getting blocked.
 
@@ -2044,9 +2279,14 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.command(usage="[user] [duration] [reason]")
+    @commands.hybrid_command(usage="[user] [duration] [reason]")
     @checks.has_permissions(PermissionLevel.MODERATOR)
     @trigger_typing
+    @app_commands.describe(
+        user_or_role="User or role to block",
+        after="Duration until auto-unblock (e.g. 2h) and optional reason",
+    )
+    @app_commands.autocomplete(user_or_role=member_role_autocomplete)
     async def block(
         self,
         ctx,
@@ -2133,10 +2373,12 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.MODERATOR)
     @trigger_typing
-    async def unblock(self, ctx, *, user_or_role: Union[User, Role] = None):
+    @app_commands.describe(user_or_role="User or role to unblock")
+    @app_commands.autocomplete(user_or_role=member_role_autocomplete)
+    async def unblock(self, ctx, user_or_role: Union[User, Role] = None):
         """
         Unblock a user from using Modmail.
 
@@ -2198,9 +2440,10 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
+    @app_commands.describe(message_id="Message ID to delete (defaults to previous staff message)")
     async def delete(self, ctx, message_id: int = None):
         """
         Delete a message that was sent using the reply command or a note.
@@ -2227,7 +2470,7 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def repair(self, ctx):
         """
@@ -2343,7 +2586,7 @@ class Modmail(commands.Cog):
                 logger.info("Multiple users with the same name and discriminator.")
         return await self.bot.add_reaction(ctx.message, blocked_emoji)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def enable(self, ctx):
         """
@@ -2363,7 +2606,7 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def disable(self, ctx):
         """
@@ -2414,7 +2657,7 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def isenable(self, ctx):
         """
@@ -2442,9 +2685,10 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.command(usage="[duration]")
+    @commands.hybrid_command(usage="[duration]")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
+    @app_commands.describe(duration="How long to snooze (e.g. 2d, 12h)")
     async def snooze(self, ctx, *, duration: UserFriendlyTime = None):
         """
         Snooze this thread. Behavior depends on config:
@@ -2587,37 +2831,28 @@ class Modmail(commands.Cog):
             await ctx.send("Failed to snooze this thread.")
             logging.error(f"[SNOOZE] Failed to snooze thread for {getattr(thread.recipient, 'id', None)}.")
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def unsnooze(self, ctx, *, user: str = None):
+    @app_commands.describe(user="User to unsnooze (defaults to current thread recipient)")
+    @app_commands.autocomplete(user=log_recipient_autocomplete)
+    async def unsnooze(self, ctx, user: User = None):
         """
         Unsnooze a thread: restores the channel and replays messages.
         You can specify a user by mention or ID, or run in a thread channel to unsnooze that thread.
         Uses config: unsnooze_text
         """
-        import discord
-
         thread = None
         user_obj = None
         if user is not None:
-            user_id = self._resolve_user(user)
-            if user_id:
-                try:
-                    user_obj = await self.bot.get_or_fetch_user(user_id)
-                except Exception:
-                    logger.debug(
-                        "Failed fetching user during unsnooze; falling back to partial object (%s).",
-                        user_id,
-                        exc_info=True,
-                    )
-                    user_obj = discord.Object(user_id)
-            if user_obj:
-                thread = await self.bot.threads.find(recipient=user_obj)
+            user_obj = user
+            if isinstance(user_obj, discord.Object):
+                user_obj = await self.bot.get_or_fetch_user(user_obj.id)
+            thread = await self.bot.threads.find(recipient=user_obj)
             if not thread:
                 await ctx.send(f"[DEBUG] No thread found for user {user} (obj: {user_obj}).")
                 logging.warning(f"[UNSNOOZE] No thread found for user {user} (obj: {user_obj})")
                 return
-        elif hasattr(ctx, "thread"):
+        elif hasattr(ctx, "thread") and ctx.thread:
             thread = ctx.thread
         else:
             await ctx.send("This is not a Modmail thread.")
@@ -2647,7 +2882,7 @@ class Modmail(commands.Cog):
                 f"[UNSNOOZE] Failed to unsnooze thread for {getattr(thread.recipient, 'id', None)}."
             )
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def snoozed(self, ctx):
         """
@@ -2694,6 +2929,10 @@ class Modmail(commands.Cog):
         await ctx.send("Snoozed threads:\n" + "\n".join(lines))
 
     async def cog_load(self):
+        guilds = self._guilds()
+        if guilds:
+            for command in self.walk_app_commands():
+                command.guilds = guilds
         self.snooze_auto_unsnooze.start()
 
     @tasks.loop(seconds=10)
@@ -2729,7 +2968,7 @@ class Modmail(commands.Cog):
             self.threads.cache[thread.id] = thread
         # ... rest of the method unchanged ...
 
-    @commands.command()
+    @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.OWNER)
     async def clearsnoozed(self, ctx):
         """

@@ -1,3 +1,4 @@
+import discord
 from discord.ext import commands
 
 from core.models import HostingMethod, PermissionLevel, getLogger
@@ -35,6 +36,26 @@ def has_permissions(permission_level: PermissionLevel = PermissionLevel.REGULAR)
     """
 
     return commands.check(has_permissions_predicate(permission_level))
+
+
+class InteractionContext:
+    """Minimal context adapter for slash interaction permission checks."""
+
+    __slots__ = ("bot", "author", "channel", "guild")
+
+    def __init__(self, interaction: discord.Interaction):
+        self.bot = interaction.client
+        self.author = interaction.user
+        self.channel = interaction.channel
+        self.guild = interaction.guild
+
+
+async def check_interaction_permissions(interaction: discord.Interaction) -> bool:
+    """Evaluate slash command permissions using the shared check_permissions logic."""
+    if interaction.command is None:
+        return True
+    ctx = InteractionContext(interaction)
+    return await check_permissions(ctx, interaction.command.qualified_name)
 
 
 async def check_permissions(ctx, command_name) -> bool:
