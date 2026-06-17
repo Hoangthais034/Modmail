@@ -1749,7 +1749,7 @@ class Utility(commands.Cog):
         type_: str.lower,
         name: str,
         *,
-        user_or_role: Union[discord.Role, utils.User, str],
+        user_or_role: str,
     ):
         """
         Add a permission to a command or a permission level.
@@ -1765,8 +1765,7 @@ class Utility(commands.Cog):
 
         Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
-        if ctx.interaction is not None:
-            user_or_role = await self._resolve_member_role(ctx, user_or_role)
+        user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
         if type_ not in {"command", "level"}:
             return await ctx.send_help(ctx.command)
@@ -1846,7 +1845,7 @@ class Utility(commands.Cog):
         type_: str.lower,
         name: str,
         *,
-        user_or_role: Union[discord.Role, utils.User, str] = None,
+        user_or_role: Optional[str] = None,
     ):
         """
         Remove permission to use a command, permission level, or command level override.
@@ -1864,7 +1863,7 @@ class Utility(commands.Cog):
 
         Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
-        if ctx.interaction is not None and user_or_role is not None:
+        if user_or_role is not None:
             user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
         if type_ not in {"command", "level", "override"} or (type_ != "override" and user_or_role is None):
@@ -2022,7 +2021,7 @@ class Utility(commands.Cog):
     async def permissions_get(
         self,
         ctx,
-        user_or_role: Union[discord.Role, utils.User, str],
+        user_or_role: str,
         *,
         name: str = None,
     ):
@@ -2052,7 +2051,7 @@ class Utility(commands.Cog):
 
         Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
         """
-        if ctx.interaction is not None and user_or_role not in {"command", "level", "override"}:
+        if user_or_role not in {"command", "level", "override"}:
             user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
         if name is None and user_or_role not in {"command", "level", "override"}:
@@ -2207,16 +2206,15 @@ class Utility(commands.Cog):
     @checks.has_permissions(PermissionLevel.OWNER)
     @app_commands.describe(target="User or role to whitelist or un-whitelist")
     @app_commands.autocomplete(target=member_role_autocomplete)
-    async def oauth_whitelist(self, ctx, target: Union[discord.Role, utils.User, str]):
+    async def oauth_whitelist(self, ctx, target: str):
         """
         Whitelist or un-whitelist a user or role to have access to logs.
 
         `target` may be a role ID, name, mention, user ID, name, or mention.
         """
-        if ctx.interaction is not None:
-            target = await self._resolve_member_role(ctx, target)
-            if isinstance(target, str):
-                raise commands.BadArgument(f'User or Role "{target}" not found')
+        target = await self._resolve_member_role(ctx, target)
+        if isinstance(target, str):
+            raise commands.BadArgument(f'User or Role "{target}" not found')
 
         whitelisted = self.bot.config["oauth_whitelist"]
 

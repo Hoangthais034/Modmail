@@ -804,7 +804,7 @@ class Modmail(commands.Cog):
     @checks.thread_only()
     @app_commands.describe(user_or_role="User or role to notify (default: yourself)")
     @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
-    async def notify(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
+    async def notify(self, ctx, user_or_role: Optional[str] = None):
         """
         Notify a user or role when the next thread message received.
 
@@ -845,7 +845,7 @@ class Modmail(commands.Cog):
     @checks.thread_only()
     @app_commands.describe(user_or_role="User or role to un-notify (default: yourself)")
     @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
-    async def unnotify(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
+    async def unnotify(self, ctx, user_or_role: Optional[str] = None):
         """
         Un-notify a user, role, or yourself from a thread.
 
@@ -884,7 +884,7 @@ class Modmail(commands.Cog):
     @checks.thread_only()
     @app_commands.describe(user_or_role="User or role to subscribe (default: yourself)")
     @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
-    async def subscribe(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
+    async def subscribe(self, ctx, user_or_role: Optional[str] = None):
         """
         Notify a user, role, or yourself for every thread message received.
 
@@ -925,7 +925,7 @@ class Modmail(commands.Cog):
     @checks.thread_only()
     @app_commands.describe(user_or_role="User or role to unsubscribe (default: yourself)")
     @app_commands.autocomplete(user_or_role=notify_target_autocomplete)
-    async def unsubscribe(self, ctx, user_or_role: Union[discord.Role, User, str, None] = None):
+    async def unsubscribe(self, ctx, user_or_role: Optional[str] = None):
         """
         Unsubscribe a user, role, or yourself from a thread.
 
@@ -2320,7 +2320,7 @@ class Modmail(commands.Cog):
     async def block(
         self,
         ctx,
-        user_or_role: Optional[Union[User, discord.Role]] = None,
+        user_or_role: Optional[str] = None,
         *,
         after: UserFriendlyTime = None,
     ):
@@ -2334,6 +2334,9 @@ class Modmail(commands.Cog):
         `user` may be a user ID, mention, or name.
         `duration` may be a simple "human-readable" time text. See `{prefix}help close` for examples.
         """
+
+        if user_or_role is not None:
+            user_or_role = await self._resolve_notify_target(ctx, user_or_role)
 
         if user_or_role is None:
             thread = ctx.thread
@@ -2408,7 +2411,7 @@ class Modmail(commands.Cog):
     @trigger_typing
     @app_commands.describe(user_or_role="User or role to unblock")
     @app_commands.autocomplete(user_or_role=member_role_autocomplete)
-    async def unblock(self, ctx, user_or_role: Union[User, Role] = None):
+    async def unblock(self, ctx, user_or_role: Optional[str] = None):
         """
         Unblock a user from using Modmail.
 
@@ -2416,6 +2419,9 @@ class Modmail(commands.Cog):
         thread channel to unblock the current recipient.
         `user` may be a user ID, mention, or name.
         """
+
+        if user_or_role is not None:
+            user_or_role = await self._resolve_notify_target(ctx, user_or_role)
 
         if user_or_role is None:
             thread = ctx.thread

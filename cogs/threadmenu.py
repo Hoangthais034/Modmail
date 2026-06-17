@@ -434,7 +434,7 @@ class ThreadCreationMenuCore(commands.Cog):
 
     # ----- submenus -----
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.group(name="submenu", invoke_without_command=True)
+    @threadmenu.group(name="submenu", invoke_without_command=True, with_app_command=False)
     async def threadmenu_submenu(self, ctx):
         """Manage submenus (create/delete/list/show and options within).
 
