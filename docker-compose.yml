@@ -1,6 +1,9 @@
 services:
   bot:
-    image: ghcr.io/modmail-dev/modmail:master
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: modmail-local:latest
     restart: unless-stopped
     environment:
       - TOKEN=${TOKEN}
@@ -9,6 +12,7 @@ services:
       - OWNERS=${OWNERS}
       - CONNECTION_URI=mongodb://mongo:${MONGO_PORT:-27048}
       - DISABLE_AUTOUPDATES=${DISABLE_AUTOUPDATES:-true}
+      - ENABLE_SLASH_COMMANDS=${ENABLE_SLASH_COMMANDS:-false}
     depends_on:
       mongo:
         condition: service_started

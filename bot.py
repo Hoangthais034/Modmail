@@ -222,13 +222,10 @@ class ModmailBot(commands.Bot):
             return False
         return True
 
-    async def _sync_slash_commands(self):
-        """Sync the application command tree to configured guilds when enabled."""
-        if not self.config.get("enable_slash_commands"):
-            return
+    def _get_slash_guild_objects(self) -> list[discord.Object]:
+        """Return Discord guild objects used for slash command registration and sync."""
         if not self.guild_id:
-            logger.warning("ENABLE_SLASH_COMMANDS is set but GUILD_ID is missing; skipping slash sync.")
-            return
+            return []
 
         guilds = [discord.Object(id=self.guild_id)]
         if self.using_multiple_server_setup:
@@ -238,8 +235,44 @@ class ModmailBot(commands.Bot):
                     guilds.append(discord.Object(id=int(modmail_guild_id)))
                 except (TypeError, ValueError):
                     logger.warning("Invalid MODMAIL_GUILD_ID; skipping modmail guild slash sync.")
+        return guilds
 
-        for guild in guilds:
+    def _apply_slash_guild_scope(self) -> int:
+        """Assign guild scope to every app command so guild sync registers hybrid commands."""
+        guilds = self._get_slash_guild_objects()
+        if not guilds:
+            return 0
+
+        count = 0
+        for command in self.tree.walk_commands():
+            command.guilds = guilds
+            count += 1
+        return count
+
+    async def _sync_slash_commands(self):
+        """Sync the application command tree to configured guilds when enabled."""
+        if not self.config.get("enable_slash_commands"):
+            logger.info(
+                "Slash commands disabled (enable_slash_commands=false). "
+                "Set ENABLE_SLASH_COMMANDS=true in the environment to sync slash commands."
+            )
+            return
+        if not self.guild_id:
+            logger.warning(
+                "ENABLE_SLASH_COMMANDS is set but GUILD_ID is missing; skipping slash sync."
+            )
+            return
+
+        scoped = self._apply_slash_guild_scope()
+        if scoped == 0:
+            logger.warning(
+                "No slash commands found in the command tree. "
+                "Ensure cogs loaded successfully before sync."
+            )
+            return
+
+        logger.info("Registering %d slash command(s) for guild sync.", scoped)
+        for guild in self._get_slash_guild_objects():
             synced = await self.tree.sync(guild=guild)
             logger.info("Synced %d slash command(s) to guild %s.", len(synced), guild.id)
 
