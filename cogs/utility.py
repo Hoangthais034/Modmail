@@ -457,6 +457,48 @@ class Utility(commands.Cog):
         """Gather optional slash user parameters into a list."""
         return [user for user in users if user is not None]
 
+    def _get_prefix_rest(self, ctx) -> str:
+        """Return the unparsed argument string from a prefix command message."""
+        message = ctx.message.content
+        prefix = ctx.prefix
+        if isinstance(prefix, list):
+            prefix = next((p for p in prefix if message.startswith(p)), "")
+        if prefix and message.startswith(prefix):
+            rest = message[len(prefix) :].lstrip()
+        else:
+            rest = message
+        for part in ctx.command.qualified_name.split():
+            if rest.lower().startswith(part.lower()):
+                rest = rest[len(part) :].lstrip()
+        return rest
+
+    async def _parse_mention_targets_from_rest(self, ctx) -> list:
+        """Parse greedy mention targets from prefix command rest."""
+        from discord.ext.commands.view import StringView
+
+        rest = self._get_prefix_rest(ctx)
+        if not rest:
+            return []
+
+        view = StringView(rest)
+        result = []
+        while not view.eof:
+            view.skip_ws()
+            if view.eof:
+                break
+            word = view.get_quoted_word()
+            if word.lower() in {"disable", "reset", "everyone", "all"}:
+                result.append(word.lower())
+                continue
+            try:
+                result.append(await commands.MemberConverter().convert(ctx, word))
+            except commands.BadArgument:
+                try:
+                    result.append(await commands.RoleConverter().convert(ctx, word))
+                except commands.BadArgument:
+                    result.append(word)
+        return result
+
     async def _resolve_member_role(self, ctx, target):
         """Resolve a member or role from slash autocomplete snowflakes."""
         if target is None:
@@ -947,7 +989,6 @@ class Utility(commands.Cog):
     async def mention(
         self,
         ctx,
-        *user_or_role: commands.Greedy[Union[discord.Role, discord.Member, str]],
         user1: Optional[str] = None,
         user2: Optional[str] = None,
         user3: Optional[str] = None,
@@ -980,6 +1021,8 @@ class Utility(commands.Cog):
                 resolved = await self._resolve_mention_target(ctx, target)
                 if resolved is not None:
                     user_or_role.append(resolved)
+        else:
+            user_or_role = await self._parse_mention_targets_from_rest(ctx)
 
         current = self.bot.config["mention"]
         if not user_or_role:

@@ -504,7 +504,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send(embed=embed)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.group(name="option", invoke_without_command=True)
+    @threadmenu_submenu.group(name="option", invoke_without_command=True, with_app_command=False)
     async def threadmenu_submenu_option(self, ctx):
         """Manage options within a specific submenu (add/remove/edit)."""
         await ctx.send_help(ctx.command)

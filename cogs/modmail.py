@@ -9,7 +9,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.ext import tasks
-from discord.ext.commands import parameter
 from discord.ext.commands.view import StringView
 from discord.ext.commands.cooldowns import BucketType
 from discord.role import Role
@@ -204,6 +203,34 @@ class Modmail(commands.Cog):
             elif isinstance(u, discord.Member):
                 users.append(u)
         return users, effective_silent
+
+    async def _parse_users_roles_from_rest(self, ctx) -> list:
+        """Parse greedy member, role, user, and literal tokens from prefix command rest."""
+        rest = self._get_prefix_rest(ctx)
+        if not rest:
+            return []
+
+        view = StringView(rest)
+        result = []
+        while not view.eof:
+            view.skip_ws()
+            if view.eof:
+                break
+            word = view.get_quoted_word()
+            if word.lower() in {"silent", "silently"}:
+                result.append(word.lower())
+                continue
+            try:
+                result.append(await commands.MemberConverter().convert(ctx, word))
+            except commands.BadArgument:
+                try:
+                    result.append(await commands.RoleConverter().convert(ctx, word))
+                except commands.BadArgument:
+                    try:
+                        result.append(await User().convert(ctx, word))
+                    except commands.BadArgument:
+                        result.append(word)
+        return result
 
     @commands.hybrid_command()
     @trigger_typing
@@ -594,8 +621,6 @@ class Modmail(commands.Cog):
         ctx,
         category: SimilarCategoryConverter = None,
         silent: bool = False,
-        *,
-        arguments: str = parameter(default="", include_in_app_command=False),
     ):
         """
         Move a thread to another category.
@@ -695,9 +720,6 @@ class Modmail(commands.Cog):
     async def close(
         self,
         ctx,
-        option: Optional[Literal["silent", "silently", "cancel"]] = parameter(
-            default="", include_in_app_command=False
-        ),
         silent: bool = False,
         cancel: bool = False,
         *,
@@ -725,8 +747,20 @@ class Modmail(commands.Cog):
         thread = ctx.thread
 
         if ctx.interaction is None:
-            silent = any(x == option for x in {"silent", "silently"})
-            cancel = option == "cancel"
+            rest = self._get_prefix_rest(ctx).strip()
+            if rest and after is None:
+                first = rest.split()[0].lower()
+                if first == "cancel":
+                    cancel = True
+                elif first in {"silent", "silently"}:
+                    silent = True
+                    rest = rest.split(None, 1)[1].strip() if len(rest.split()) > 1 else ""
+                    if rest:
+                        after = await UserFriendlyTime().convert(ctx, rest)
+                else:
+                    after = await UserFriendlyTime().convert(ctx, rest)
+            elif rest and rest.split()[0].lower() == "cancel":
+                cancel = True
 
         close_after = (after.dt - after.now).total_seconds() if after else 0
 
@@ -1051,7 +1085,6 @@ class Modmail(commands.Cog):
     async def adduser(
         self,
         ctx,
-        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
         user1: Optional[Union[discord.Member, discord.Role]] = None,
         user2: Optional[Union[discord.Member, discord.Role]] = None,
         user3: Optional[Union[discord.Member, discord.Role]] = None,
@@ -1065,6 +1098,8 @@ class Modmail(commands.Cog):
         """
         if ctx.interaction is not None:
             users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        else:
+            users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
@@ -1166,7 +1201,6 @@ class Modmail(commands.Cog):
     async def removeuser(
         self,
         ctx,
-        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
         user1: Optional[Union[discord.Member, discord.Role]] = None,
         user2: Optional[Union[discord.Member, discord.Role]] = None,
         user3: Optional[Union[discord.Member, discord.Role]] = None,
@@ -1180,6 +1214,8 @@ class Modmail(commands.Cog):
         """
         if ctx.interaction is not None:
             users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        else:
+            users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
@@ -1277,7 +1313,6 @@ class Modmail(commands.Cog):
     async def anonadduser(
         self,
         ctx,
-        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
         user1: Optional[Union[discord.Member, discord.Role]] = None,
         user2: Optional[Union[discord.Member, discord.Role]] = None,
         user3: Optional[Union[discord.Member, discord.Role]] = None,
@@ -1291,6 +1326,8 @@ class Modmail(commands.Cog):
         """
         if ctx.interaction is not None:
             users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        else:
+            users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
@@ -1385,7 +1422,6 @@ class Modmail(commands.Cog):
     async def anonremoveuser(
         self,
         ctx,
-        *users_arg: commands.Greedy[Union[discord.Member, discord.Role, str]],
         user1: Optional[Union[discord.Member, discord.Role]] = None,
         user2: Optional[Union[discord.Member, discord.Role]] = None,
         user3: Optional[Union[discord.Member, discord.Role]] = None,
@@ -1399,6 +1435,8 @@ class Modmail(commands.Cog):
         """
         if ctx.interaction is not None:
             users_arg = self._collect_users(user1, user2, user3, user4, user5)
+        else:
+            users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
 
         for u in users:
@@ -1912,7 +1950,7 @@ class Modmail(commands.Cog):
                 await ctx.send(embed=embed, delete_after=10)
                 return
 
-        await ctx.invoke(self.contact, users_arg=[ctx.author])
+        await ctx.invoke(self.contact, user1=ctx.author)
 
     @commands.hybrid_command(usage="<user> [category] [options]")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
@@ -1936,14 +1974,6 @@ class Modmail(commands.Cog):
     async def contact(
         self,
         ctx,
-        *users_arg: commands.Greedy[
-            Union[
-                Literal["silent", "silently"],
-                discord.Member,
-                discord.User,
-                discord.Role,
-            ]
-        ],
         user1: Optional[Union[discord.Member, discord.User]] = None,
         user2: Optional[Union[discord.Member, discord.User]] = None,
         user3: Optional[Union[discord.Member, discord.User]] = None,
@@ -1951,7 +1981,6 @@ class Modmail(commands.Cog):
         user5: Optional[Union[discord.Member, discord.User]] = None,
         category: SimilarCategoryConverter = None,
         silent: bool = False,
-        manual_trigger: bool = parameter(default=True, include_in_app_command=False),
     ):
         """
         Create a thread with a specified member.
@@ -1964,10 +1993,11 @@ class Modmail(commands.Cog):
         A maximum of 5 users are allowed.
         `options` can be `silent` or `silently`.
         """
+        manual_trigger = True
         if ctx.interaction is not None:
             users = self._collect_users(user1, user2, user3, user4, user5)
         else:
-            users = list(users_arg)
+            users = await self._parse_users_roles_from_rest(ctx)
 
         if ctx.interaction is None and any(x in users for x in ("silent", "silently")):
             silent = True
