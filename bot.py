@@ -209,7 +209,10 @@ class ModmailBot(commands.Bot):
             if ctx.thread is None and ctx.channel is not None:
                 ctx.thread = await self.threads.find(channel=ctx.channel)
 
-        self.tree.interaction_check(self._slash_interaction_check)
+        @self.tree.interaction_check()
+        async def slash_interaction_check(interaction: discord.Interaction) -> bool:
+            return await self._slash_interaction_check(interaction)
+
         if self.extensions:
             await self._sync_slash_commands()
 
@@ -272,14 +275,28 @@ class ModmailBot(commands.Bot):
             )
             return
 
+        guilds = self._get_slash_guild_objects()
+        if self.config.get("slash_reset_on_start"):
+            logger.info("Clearing guild slash commands before sync (slash_reset_on_start=true).")
+            for guild in guilds:
+                self.tree.clear_commands(guild=guild)
+                try:
+                    await self.tree.sync(guild=guild)
+                except discord.HTTPException:
+                    logger.exception("Failed to clear slash commands for guild %s.", guild.id)
+
         logger.info(
             "Registering %d slash command(s) for guild sync (enable_slash_commands=%s, guild_id=%s).",
             scoped,
             self.config.get("enable_slash_commands"),
             self.guild_id,
         )
-        for guild in self._get_slash_guild_objects():
-            synced = await self.tree.sync(guild=guild)
+        for guild in guilds:
+            try:
+                synced = await self.tree.sync(guild=guild)
+            except discord.HTTPException:
+                logger.exception("Failed to sync slash commands to guild %s.", guild.id)
+                continue
             logger.info("Synced %d slash command(s) to guild %s.", len(synced), guild.id)
             if len(synced) == 0 and scoped > 0:
                 logger.warning(

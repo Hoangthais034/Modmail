@@ -13,6 +13,7 @@ services:
       - CONNECTION_URI=mongodb://mongo:${MONGO_PORT:-27048}
       - DISABLE_AUTOUPDATES=${DISABLE_AUTOUPDATES:-true}
       - ENABLE_SLASH_COMMANDS=${ENABLE_SLASH_COMMANDS:-false}
+      - SLASH_RESET_ON_START=${SLASH_RESET_ON_START:-false}
     depends_on:
       mongo:
         condition: service_started

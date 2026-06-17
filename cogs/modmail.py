@@ -140,6 +140,67 @@ class Modmail(commands.Cog):
         """Gather optional slash user parameters into a list."""
         return [user for user in users if user is not None]
 
+    async def _collect_slash_users(self, ctx, *users) -> list:
+        """Resolve optional slash user/role string parameters into Discord objects."""
+        result = []
+        guild = ctx.guild or self.bot.modmail_guild
+        for user in users:
+            if user is None:
+                continue
+            if isinstance(user, (discord.Member, discord.Role, discord.User)):
+                result.append(user)
+                continue
+            if isinstance(user, str):
+                if guild is not None and user.isdigit():
+                    member = guild.get_member(int(user))
+                    if member is not None:
+                        result.append(member)
+                        continue
+                    role = guild.get_role(int(user))
+                    if role is not None:
+                        result.append(role)
+                        continue
+                try:
+                    result.append(await commands.MemberConverter().convert(ctx, user))
+                    continue
+                except commands.BadArgument:
+                    pass
+                try:
+                    result.append(await commands.RoleConverter().convert(ctx, user))
+                    continue
+                except commands.BadArgument:
+                    pass
+                try:
+                    result.append(await User().convert(ctx, user))
+                    continue
+                except commands.BadArgument:
+                    pass
+                result.append(user)
+        return result
+
+    async def _resolve_log_user(self, ctx, user):
+        """Resolve a log user from slash string input or pass through Discord objects."""
+        if user is None:
+            return None
+        if not isinstance(user, str):
+            return user
+        return await User().convert(ctx, user)
+
+    async def _resolve_guild_member(self, ctx, user):
+        """Resolve a guild member from slash string input or pass through Member objects."""
+        if user is None:
+            return None
+        if isinstance(user, discord.Member):
+            return user
+        if isinstance(user, str):
+            guild = ctx.guild or self.bot.modmail_guild
+            if guild is not None and user.isdigit():
+                member = guild.get_member(int(user))
+                if member is not None:
+                    return member
+            return await commands.MemberConverter().convert(ctx, user)
+        return user
+
     def _get_prefix_rest(self, ctx) -> str:
         """Return the unparsed argument string from a prefix command message."""
         message = ctx.message.content
@@ -619,7 +680,7 @@ class Modmail(commands.Cog):
     async def move(
         self,
         ctx,
-        category: SimilarCategoryConverter = None,
+        category: Optional[str] = None,
         silent: bool = False,
     ):
         """
@@ -628,7 +689,11 @@ class Modmail(commands.Cog):
         `category` may be a category ID, mention, or name.
         `options` is a string which takes in arguments on how to perform the move. Ex: "silently"
         """
-        if ctx.interaction is None:
+        if ctx.interaction is not None:
+            if category is None:
+                raise commands.MissingRequiredArgument(DummyParam("category"))
+            category = await SimilarCategoryConverter().convert(ctx, category)
+        elif ctx.interaction is None:
             arguments = self._get_prefix_rest(ctx)
             if not arguments:
                 raise commands.MissingRequiredArgument(DummyParam("category"))
@@ -658,8 +723,6 @@ class Modmail(commands.Cog):
             if options:
                 silent_words = ["silent", "silently"]
                 silent = any(word in silent_words for word in options.split())
-        elif category is None:
-            raise commands.MissingRequiredArgument(DummyParam("category"))
 
         thread = ctx.thread
 
@@ -1085,11 +1148,11 @@ class Modmail(commands.Cog):
     async def adduser(
         self,
         ctx,
-        user1: Optional[Union[discord.Member, discord.Role]] = None,
-        user2: Optional[Union[discord.Member, discord.Role]] = None,
-        user3: Optional[Union[discord.Member, discord.Role]] = None,
-        user4: Optional[Union[discord.Member, discord.Role]] = None,
-        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        user1: Optional[str] = None,
+        user2: Optional[str] = None,
+        user3: Optional[str] = None,
+        user4: Optional[str] = None,
+        user5: Optional[str] = None,
         silent: bool = False,
     ):
         """Adds a user to a modmail thread
@@ -1097,7 +1160,7 @@ class Modmail(commands.Cog):
         `options` can be `silent` or `silently`.
         """
         if ctx.interaction is not None:
-            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+            users_arg = await self._collect_slash_users(ctx, user1, user2, user3, user4, user5)
         else:
             users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
@@ -1201,11 +1264,11 @@ class Modmail(commands.Cog):
     async def removeuser(
         self,
         ctx,
-        user1: Optional[Union[discord.Member, discord.Role]] = None,
-        user2: Optional[Union[discord.Member, discord.Role]] = None,
-        user3: Optional[Union[discord.Member, discord.Role]] = None,
-        user4: Optional[Union[discord.Member, discord.Role]] = None,
-        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        user1: Optional[str] = None,
+        user2: Optional[str] = None,
+        user3: Optional[str] = None,
+        user4: Optional[str] = None,
+        user5: Optional[str] = None,
         silent: bool = False,
     ):
         """Removes a user from a modmail thread
@@ -1213,7 +1276,7 @@ class Modmail(commands.Cog):
         `options` can be `silent` or `silently`.
         """
         if ctx.interaction is not None:
-            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+            users_arg = await self._collect_slash_users(ctx, user1, user2, user3, user4, user5)
         else:
             users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
@@ -1313,11 +1376,11 @@ class Modmail(commands.Cog):
     async def anonadduser(
         self,
         ctx,
-        user1: Optional[Union[discord.Member, discord.Role]] = None,
-        user2: Optional[Union[discord.Member, discord.Role]] = None,
-        user3: Optional[Union[discord.Member, discord.Role]] = None,
-        user4: Optional[Union[discord.Member, discord.Role]] = None,
-        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        user1: Optional[str] = None,
+        user2: Optional[str] = None,
+        user3: Optional[str] = None,
+        user4: Optional[str] = None,
+        user5: Optional[str] = None,
         silent: bool = False,
     ):
         """Adds a user to a modmail thread anonymously
@@ -1325,7 +1388,7 @@ class Modmail(commands.Cog):
         `options` can be `silent` or `silently`.
         """
         if ctx.interaction is not None:
-            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+            users_arg = await self._collect_slash_users(ctx, user1, user2, user3, user4, user5)
         else:
             users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
@@ -1422,11 +1485,11 @@ class Modmail(commands.Cog):
     async def anonremoveuser(
         self,
         ctx,
-        user1: Optional[Union[discord.Member, discord.Role]] = None,
-        user2: Optional[Union[discord.Member, discord.Role]] = None,
-        user3: Optional[Union[discord.Member, discord.Role]] = None,
-        user4: Optional[Union[discord.Member, discord.Role]] = None,
-        user5: Optional[Union[discord.Member, discord.Role]] = None,
+        user1: Optional[str] = None,
+        user2: Optional[str] = None,
+        user3: Optional[str] = None,
+        user4: Optional[str] = None,
+        user5: Optional[str] = None,
         silent: bool = False,
     ):
         """Removes a user from a modmail thread anonymously
@@ -1434,7 +1497,7 @@ class Modmail(commands.Cog):
         `options` can be `silent` or `silently`.
         """
         if ctx.interaction is not None:
-            users_arg = self._collect_users(user1, user2, user3, user4, user5)
+            users_arg = await self._collect_slash_users(ctx, user1, user2, user3, user4, user5)
         else:
             users_arg = await self._parse_users_roles_from_rest(ctx)
         users, silent = self._expand_users_arg(ctx, users_arg, silent)
@@ -1514,7 +1577,7 @@ class Modmail(commands.Cog):
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @app_commands.describe(user="Member to view logs for")
     @app_commands.autocomplete(user=log_recipient_autocomplete)
-    async def logs(self, ctx, user: User = None):
+    async def logs(self, ctx, user: Optional[str] = None):
         """
         Get previous Modmail thread logs of a member.
 
@@ -1525,6 +1588,9 @@ class Modmail(commands.Cog):
 
         async with safe_typing(ctx):
             pass
+
+        if ctx.interaction is not None and user is not None:
+            user = await self._resolve_log_user(ctx, user)
 
         if not user:
             thread = ctx.thread
@@ -1555,13 +1621,15 @@ class Modmail(commands.Cog):
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @app_commands.describe(user="Staff member who closed the logs")
     @app_commands.autocomplete(user=guild_member_autocomplete)
-    async def logs_closed_by(self, ctx, user: User = None):
+    async def logs_closed_by(self, ctx, user: Optional[str] = None):
         """
         Get all logs closed by the specified user.
 
         If no `user` is provided, the user will be the person who sent this command.
         `user` may be a user ID, mention, or name.
         """
+        if ctx.interaction is not None and user is not None:
+            user = await self._resolve_guild_member(ctx, user)
         user = user if user is not None else ctx.author
 
         entries = await self.bot.api.search_closed_by(user.id)
@@ -1632,13 +1700,15 @@ class Modmail(commands.Cog):
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @app_commands.describe(user="Staff member who responded in the logs")
     @app_commands.autocomplete(user=guild_member_autocomplete)
-    async def logs_responded(self, ctx, user: User = None):
+    async def logs_responded(self, ctx, user: Optional[str] = None):
         """
         Get all logs where the specified user has responded at least once.
 
         If no `user` is provided, the user will be the person who sent this command.
         `user` may be a user ID, mention, or name.
         """
+        if ctx.interaction is not None and user is not None:
+            user = await self._resolve_guild_member(ctx, user)
         user = user if user is not None else ctx.author
 
         entries = await self.bot.api.get_responded_logs(user.id)
@@ -1974,12 +2044,12 @@ class Modmail(commands.Cog):
     async def contact(
         self,
         ctx,
-        user1: Optional[Union[discord.Member, discord.User]] = None,
-        user2: Optional[Union[discord.Member, discord.User]] = None,
-        user3: Optional[Union[discord.Member, discord.User]] = None,
-        user4: Optional[Union[discord.Member, discord.User]] = None,
-        user5: Optional[Union[discord.Member, discord.User]] = None,
-        category: SimilarCategoryConverter = None,
+        user1: Optional[str] = None,
+        user2: Optional[str] = None,
+        user3: Optional[str] = None,
+        user4: Optional[str] = None,
+        user5: Optional[str] = None,
+        category: Optional[str] = None,
         silent: bool = False,
     ):
         """
@@ -1995,7 +2065,7 @@ class Modmail(commands.Cog):
         """
         manual_trigger = True
         if ctx.interaction is not None:
-            users = self._collect_users(user1, user2, user3, user4, user5)
+            users = await self._collect_slash_users(ctx, user1, user2, user3, user4, user5)
         else:
             users = await self._parse_users_roles_from_rest(ctx)
 
@@ -2257,12 +2327,15 @@ class Modmail(commands.Cog):
     @trigger_typing
     @app_commands.describe(user="User to whitelist or un-whitelist from blocking")
     @app_commands.autocomplete(user=log_recipient_autocomplete)
-    async def blocked_whitelist(self, ctx, user: User = None):
+    async def blocked_whitelist(self, ctx, user: Optional[str] = None):
         """
         Whitelist or un-whitelist a user from getting blocked.
 
         Useful for preventing users from getting blocked by account_age/guild_age restrictions.
         """
+        if ctx.interaction is not None and user is not None:
+            user = await self._resolve_log_user(ctx, user)
+
         if user is None:
             thread = ctx.thread
             if thread:
@@ -2871,12 +2944,15 @@ class Modmail(commands.Cog):
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @app_commands.describe(user="User to unsnooze (defaults to current thread recipient)")
     @app_commands.autocomplete(user=log_recipient_autocomplete)
-    async def unsnooze(self, ctx, user: User = None):
+    async def unsnooze(self, ctx, user: Optional[str] = None):
         """
         Unsnooze a thread: restores the channel and replays messages.
         You can specify a user by mention or ID, or run in a thread channel to unsnooze that thread.
         Uses config: unsnooze_text
         """
+        if ctx.interaction is not None and user is not None:
+            user = await self._resolve_log_user(ctx, user)
+
         thread = None
         user_obj = None
         if user is not None:

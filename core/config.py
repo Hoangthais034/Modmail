@@ -212,6 +212,7 @@ class ConfigManager:
         "enable_plugins": True,
         "enable_eval": True,
         "enable_slash_commands": False,
+        "slash_reset_on_start": False,
         # github access token for private repositories
         "github_token": None,
         "disable_autoupdates": False,
