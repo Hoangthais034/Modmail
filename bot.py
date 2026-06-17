@@ -70,6 +70,18 @@ if sys.platform == "win32":
         logger.error("Failed to use WindowsProactorEventLoopPolicy.", exc_info=True)
 
 
+class ModmailCommandTree(commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Enforce Modmail permission levels for slash command interactions."""
+        if not await checks.check_interaction_permissions(interaction):
+            if interaction.response.is_done():
+                await interaction.followup.send("You do not have permission.", ephemeral=True)
+            else:
+                await interaction.response.send_message("You do not have permission.", ephemeral=True)
+            return False
+        return True
+
+
 class ModmailBot(commands.Bot):
     def __init__(self):
         self.config = ConfigManager(self)
@@ -79,7 +91,7 @@ class ModmailBot(commands.Bot):
         if not self.config["enable_presence_intent"]:
             intents.presences = False
 
-        super().__init__(command_prefix=None, intents=intents)  # implemented in `get_prefix`
+        super().__init__(command_prefix=None, intents=intents, tree_cls=ModmailCommandTree)  # implemented in `get_prefix`
         self.session = None
         self._api = None
         self.formatter = SafeFormatter()
@@ -209,22 +221,8 @@ class ModmailBot(commands.Bot):
             if ctx.thread is None and ctx.channel is not None:
                 ctx.thread = await self.threads.find(channel=ctx.channel)
 
-        @self.tree.interaction_check()
-        async def slash_interaction_check(interaction: discord.Interaction) -> bool:
-            return await self._slash_interaction_check(interaction)
-
         if self.extensions:
             await self._sync_slash_commands()
-
-    async def _slash_interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Enforce Modmail permission levels for slash command interactions."""
-        if not await checks.check_interaction_permissions(interaction):
-            if interaction.response.is_done():
-                await interaction.followup.send("You do not have permission.", ephemeral=True)
-            else:
-                await interaction.response.send_message("You do not have permission.", ephemeral=True)
-            return False
-        return True
 
     def _get_slash_guild_objects(self) -> list[discord.Object]:
         """Return Discord guild objects used for slash command registration and sync."""
