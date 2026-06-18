@@ -351,7 +351,12 @@ class ConfigManager:
 
     def _apply_env_protected_overrides(self) -> None:
         """Reapply protected keys from environment after loading database config."""
+        self._capture_env_protected_overrides()
         for key, value in self._env_protected_overrides.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
             self._cache[key] = value
 
     async def update(self):

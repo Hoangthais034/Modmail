@@ -5,6 +5,70 @@ from difflib import get_close_matches
 import discord
 from discord import app_commands
 
+from core.slash_dispatch import static_action_autocomplete
+
+REPLY_MODES = [
+    "normal",
+    "anonymous",
+    "plain",
+    "plain_anonymous",
+    "format",
+    "format_anonymous",
+    "format_plain",
+    "format_plain_anonymous",
+]
+
+SNIPPET_ACTIONS = ["list", "view", "raw", "add", "remove", "edit"]
+LOGS_ACTIONS = ["view", "closed_by", "key", "delete", "responded", "search"]
+NOTE_ACTIONS = ["normal", "persistent"]
+BLOCKED_ACTIONS = ["list", "whitelist", "block", "unblock"]
+CONTROL_ACTIONS = ["enable", "disable_new", "disable_all", "status"]
+SNOOZE_ACTIONS = ["snooze", "unsnooze", "list", "clear"]
+DEBUG_ACTIONS = ["help", "hastebin", "clear"]
+CONFIG_ACTIONS = ["help", "options", "get", "set", "remove"]
+ALIAS_ACTIONS = ["view", "raw", "add", "remove", "edit"]
+PERMISSIONS_ACTIONS = ["help", "override", "add", "remove", "get"]
+OAUTH_ACTIONS = ["help", "whitelist", "show"]
+AUTOTRIGGER_ACTIONS = ["list", "add", "edit", "remove", "test"]
+PLUGINS_ACTIONS = [
+    "help",
+    "add",
+    "remove",
+    "update",
+    "reset",
+    "loaded",
+    "registry",
+    "registry_compact",
+]
+THREADMENU_ACTIONS = [
+    "toggle",
+    "show",
+    "option_show",
+    "option_remove",
+    "option_edit",
+    "dump_config",
+    "reset",
+    "load_config",
+]
+
+SNOOZE_DURATION_PRESETS = ["1h", "6h", "12h", "1d", "2d", "7d"]
+
+reply_mode_autocomplete = static_action_autocomplete(REPLY_MODES)
+snippet_action_autocomplete = static_action_autocomplete(SNIPPET_ACTIONS)
+logs_action_autocomplete = static_action_autocomplete(LOGS_ACTIONS)
+note_action_autocomplete = static_action_autocomplete(NOTE_ACTIONS)
+blocked_action_autocomplete = static_action_autocomplete(BLOCKED_ACTIONS)
+control_action_autocomplete = static_action_autocomplete(CONTROL_ACTIONS)
+snooze_action_autocomplete = static_action_autocomplete(SNOOZE_ACTIONS)
+debug_action_autocomplete = static_action_autocomplete(DEBUG_ACTIONS)
+config_action_autocomplete = static_action_autocomplete(CONFIG_ACTIONS)
+alias_action_autocomplete = static_action_autocomplete(ALIAS_ACTIONS)
+permissions_action_autocomplete = static_action_autocomplete(PERMISSIONS_ACTIONS)
+oauth_action_autocomplete = static_action_autocomplete(OAUTH_ACTIONS)
+autotrigger_action_autocomplete = static_action_autocomplete(AUTOTRIGGER_ACTIONS)
+plugins_action_autocomplete = static_action_autocomplete(PLUGINS_ACTIONS)
+threadmenu_action_autocomplete = static_action_autocomplete(THREADMENU_ACTIONS)
+
 
 def _format_recipient_choice(recipient: dict) -> tuple[str, str]:
     """Build display label and snowflake value for a log recipient document."""
@@ -210,6 +274,25 @@ async def plugin_name_autocomplete(
     for name in names[:25]:
         choices.append(app_commands.Choice(name=name[:100], value=name))
     return choices
+
+
+async def snooze_duration_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Suggest snooze durations with the configured default first."""
+    bot = interaction.client
+    default = bot.config.get("snooze_default_duration") or "1d"
+    presets = []
+    for value in [default, *SNOOZE_DURATION_PRESETS]:
+        if value not in presets:
+            presets.append(value)
+
+    current_lower = (current or "").casefold()
+    if current_lower:
+        presets = [value for value in presets if current_lower in value.casefold()]
+
+    return [app_commands.Choice(name=value[:100], value=value) for value in presets[:25]]
 
 
 async def threadmenu_label_autocomplete(

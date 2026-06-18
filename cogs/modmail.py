@@ -16,14 +16,29 @@ from discord.utils import escape_markdown
 
 from dateutil import parser
 
-from core import checks
+from core import checks, slash_dispatch
 from core.autocomplete import (
+    REPLY_MODES,
+    SNIPPET_ACTIONS,
+    blocked_action_autocomplete,
     category_autocomplete,
+    control_action_autocomplete,
     guild_member_autocomplete,
     guild_role_autocomplete,
     log_key_autocomplete,
     log_recipient_autocomplete,
+    logs_action_autocomplete,
+    LOGS_ACTIONS,
+    note_action_autocomplete,
+    NOTE_ACTIONS,
+    BLOCKED_ACTIONS,
+    CONTROL_ACTIONS,
+    SNOOZE_ACTIONS,
+    reply_mode_autocomplete,
+    snippet_action_autocomplete,
     snippet_autocomplete,
+    snooze_action_autocomplete,
+    snooze_duration_autocomplete,
 )
 from core.models import DMDisabled, PermissionLevel, SimilarCategoryConverter, getLogger
 from core.paginator import EmbedPaginatorSession
@@ -135,6 +150,13 @@ class Modmail(commands.Cog):
                 except (TypeError, ValueError):
                     pass
         return guilds
+
+    async def _ensure_permission_level(self, ctx, permission_level: PermissionLevel) -> bool:
+        """Return False and send an ephemeral error when the author lacks the required level."""
+        if await checks.has_at_least_permission(ctx, permission_level):
+            return True
+        await ctx.send_error("You do not have permission.")
+        return False
 
     def _collect_users(self, *users) -> list:
         """Gather optional slash user parameters into a list."""
@@ -382,68 +404,28 @@ class Modmail(commands.Cog):
             for owner_id in self.bot.bot_owner_ids:
                 await self.bot.update_perms(PermissionLevel.OWNER, owner_id)
 
-    @commands.hybrid_group(aliases=["snippets"], invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(name="Snippet name to view")
-    @app_commands.autocomplete(name=snippet_autocomplete)
-    async def snippet(self, ctx, name: str = None):
-        """
-        Create pre-defined messages for use in threads.
-
-        When `{prefix}snippet` is used by itself, this will retrieve
-        a list of snippets that are currently set. `{prefix}snippet-name` will show what the
-        snippet point to.
-
-        To create a snippet:
-        - `{prefix}snippet add snippet-name A pre-defined text.`
-
-        You can use your snippet in a thread channel
-        with `{prefix}snippet-name`, the message "A pre-defined text."
-        will be sent to the recipient.
-
-        Currently, there is not a built-in anonymous snippet command; however, a workaround
-        is available using `{prefix}alias`. Here is how:
-        - `{prefix}alias add snippet-name anonreply A pre-defined anonymous text.`
-
-        See also `{prefix}alias`.
-        """
-
-        if name is not None:
-            name = name.lower()
-            if name == "compact":
-                embeds = []
-
-                for i, names in enumerate(zip_longest(*(iter(sorted(self.bot.snippets)),) * 15)):
-                    description = format_description(i, names)
-                    embed = discord.Embed(color=self.bot.main_color, description=description)
-                    embed.set_author(
-                        name="Snippets", icon_url=self.bot.get_guild_icon(guild=ctx.guild, size=128)
-                    )
-                    embeds.append(embed)
-
-                session = EmbedPaginatorSession(ctx, *embeds)
-                await session.run()
-                return
-
-            snippet_name = self.bot._resolve_snippet(name.lower())
-
-            if snippet_name is None:
-                embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
-            else:
-                val = self.bot.snippets[snippet_name]
-                embed = discord.Embed(
-                    title=f'Snippet - "{snippet_name}":',
-                    description=val,
-                    color=self.bot.main_color,
+    async def _snippet_list(self, ctx, *, compact: bool = False):
+        """List configured snippets, optionally in compact paginated form."""
+        if compact:
+            embeds = []
+            for i, names in enumerate(zip_longest(*(iter(sorted(self.bot.snippets)),) * 15)):
+                description = format_description(i, names)
+                embed = discord.Embed(color=self.bot.main_color, description=description)
+                embed.set_author(
+                    name="Snippets", icon_url=self.bot.get_guild_icon(guild=ctx.guild, size=128)
                 )
-            return await ctx.send(embed=embed)
+                embeds.append(embed)
+
+            session = EmbedPaginatorSession(ctx, *embeds)
+            await session.run()
+            return
 
         if not self.bot.snippets:
             embed = discord.Embed(
                 color=self.bot.error_color,
                 description="You dont have any snippets at the moment.",
             )
-            embed.set_footer(text=f'Check "{self.bot.prefix}help snippet add" to add a snippet.')
+            embed.set_footer(text=f'Check "/snippet" with action `add` to add a snippet.')
             embed.set_author(
                 name="Snippets",
                 icon_url=self.bot.get_guild_icon(guild=ctx.guild, size=128),
@@ -462,14 +444,27 @@ class Modmail(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @snippet.command(name="raw")
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(name="Snippet name")
-    @app_commands.autocomplete(name=snippet_autocomplete)
-    async def snippet_raw(self, ctx, *, name: str):
-        """
-        View the raw content of a snippet.
-        """
+    async def _snippet_view(self, ctx, name: str):
+        """Show a single snippet by name."""
+        name = name.lower()
+        if name == "compact":
+            return await self._snippet_list(ctx, compact=True)
+
+        snippet_name = self.bot._resolve_snippet(name.lower())
+
+        if snippet_name is None:
+            embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
+        else:
+            val = self.bot.snippets[snippet_name]
+            embed = discord.Embed(
+                title=f'Snippet - "{snippet_name}":',
+                description=val,
+                color=self.bot.main_color,
+            )
+        return await ctx.send(embed=embed)
+
+    async def _snippet_raw(self, ctx, name: str):
+        """Show raw snippet content."""
         snippet_name = self.bot._resolve_snippet(name.lower())
         if snippet_name is None:
             embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
@@ -483,21 +478,9 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @snippet.command(name="add", aliases=["create", "make"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def snippet_add(self, ctx, name: str.lower, *, value: commands.clean_content):
-        """
-        Add a snippet.
-
-        Simply to add a snippet, do: ```
-        {prefix}snippet add hey hello there :)
-        ```
-        then when you type `{prefix}hey`, "hello there :)" will get sent to the recipient.
-
-        To add a multi-word snippet name, use quotes: ```
-        {prefix}snippet add "two word" this is a two word snippet.
-        ```
-        """
+    async def _snippet_add(self, ctx, name: str, value: str):
+        """Add a new snippet."""
+        name = name.lower()
         if self.bot.get_command(name):
             embed = discord.Embed(
                 title="Error",
@@ -539,62 +522,8 @@ class Modmail(commands.Cog):
         )
         return await ctx.send(embed=embed)
 
-    def _fix_aliases(self, snippet_being_deleted: str) -> Tuple[List[str]]:
-        """
-        Remove references to the snippet being deleted from aliases.
-
-        Direct aliases to snippets are deleted, and aliases having
-        other steps are edited.
-
-        A tuple of dictionaries are returned. The first dictionary
-        contains a mapping of alias names which were deleted to their
-        original value, and the second dictionary contains a mapping
-        of alias names which were edited to their original value.
-        """
-        deleted = {}
-        edited = {}
-
-        # Using a copy since we might need to delete aliases
-        for alias, val in self.bot.aliases.copy().items():
-            values = parse_alias(val)
-
-            save_aliases = []
-
-            for val in values:
-                view = StringView(val)
-                linked_command = view.get_word().lower()
-                message = view.read_rest()
-
-                if linked_command == snippet_being_deleted:
-                    continue
-
-                is_valid_snippet = snippet_being_deleted in self.bot.snippets
-
-                if not self.bot.get_command(linked_command) and not is_valid_snippet:
-                    alias_command = self.bot.aliases[linked_command]
-                    save_aliases.extend(normalize_alias(alias_command, message))
-                else:
-                    save_aliases.append(val)
-
-            if not save_aliases:
-                original_value = self.bot.aliases.pop(alias)
-                deleted[alias] = original_value
-            else:
-                original_alias = self.bot.aliases[alias]
-                new_alias = " && ".join(f'"{a}"' for a in save_aliases)
-
-                if original_alias != new_alias:
-                    self.bot.aliases[alias] = new_alias
-                    edited[alias] = original_alias
-
-        return deleted, edited
-
-    @snippet.command(name="remove", aliases=["del", "delete"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(name="Snippet name to remove")
-    @app_commands.autocomplete(name=snippet_autocomplete)
-    async def snippet_remove(self, ctx, *, name: str):
-        """Remove a snippet."""
+    async def _snippet_remove(self, ctx, name: str):
+        """Remove a snippet by name."""
         name = name.lower()
         if name in self.bot.snippets:
             deleted_aliases, edited_aliases = self._fix_aliases(name)
@@ -646,18 +575,8 @@ class Modmail(commands.Cog):
             embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
         await ctx.send(embed=embed)
 
-    @snippet.command(name="edit")
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(name="Snippet name to edit", value="New snippet content")
-    @app_commands.autocomplete(name=snippet_autocomplete)
-    async def snippet_edit(self, ctx, name: str, *, value):
-        """
-        Edit a snippet.
-
-        To edit a multi-word snippet name, use quotes: ```
-        {prefix}snippet edit "two word" this is a new two word snippet.
-        ```
-        """
+    async def _snippet_edit(self, ctx, name: str, value: str):
+        """Edit an existing snippet."""
         name = name.lower()
         if name in self.bot.snippets:
             self.bot.snippets[name] = value
@@ -671,6 +590,105 @@ class Modmail(commands.Cog):
         else:
             embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
         await ctx.send(embed=embed)
+
+    @app_commands.command(name="snippet", description="Create and manage pre-defined thread messages.")
+    @app_commands.describe(
+        action="Snippet action to perform",
+        name="Snippet name",
+        value="Snippet content for add or edit",
+    )
+    @app_commands.autocomplete(action=snippet_action_autocomplete, name=snippet_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.SUPPORTER)
+    async def snippet_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        name: str = "",
+        value: str = "",
+    ):
+        """Dispatch merged slash snippet actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, SNIPPET_ACTIONS, command_name="snippet"):
+            return
+
+        await ctx.defer()
+
+        if action == "list":
+            return await self._snippet_list(ctx)
+        if action == "view":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            return await self._snippet_view(ctx, name)
+        if action == "raw":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            return await self._snippet_raw(ctx, name)
+        if action == "add":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, value, "value", for_action=action):
+                return
+            return await self._snippet_add(ctx, name, value)
+        if action == "remove":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            return await self._snippet_remove(ctx, name)
+        if action == "edit":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, value, "value", for_action=action):
+                return
+            return await self._snippet_edit(ctx, name, value)
+
+    def _fix_aliases(self, snippet_being_deleted: str) -> Tuple[List[str]]:
+        """
+        Remove references to the snippet being deleted from aliases.
+
+        Direct aliases to snippets are deleted, and aliases having
+        other steps are edited.
+
+        A tuple of dictionaries are returned. The first dictionary
+        contains a mapping of alias names which were deleted to their
+        original value, and the second dictionary contains a mapping
+        of alias names which were edited to their original value.
+        """
+        deleted = {}
+        edited = {}
+
+        # Using a copy since we might need to delete aliases
+        for alias, val in self.bot.aliases.copy().items():
+            values = parse_alias(val)
+
+            save_aliases = []
+
+            for val in values:
+                view = StringView(val)
+                linked_command = view.get_word().lower()
+                message = view.read_rest()
+
+                if linked_command == snippet_being_deleted:
+                    continue
+
+                is_valid_snippet = snippet_being_deleted in self.bot.snippets
+
+                if not self.bot.get_command(linked_command) and not is_valid_snippet:
+                    alias_command = self.bot.aliases[linked_command]
+                    save_aliases.extend(normalize_alias(alias_command, message))
+                else:
+                    save_aliases.append(val)
+
+            if not save_aliases:
+                original_value = self.bot.aliases.pop(alias)
+                deleted[alias] = original_value
+            else:
+                original_alias = self.bot.aliases[alias]
+                new_alias = " && ".join(f'"{a}"' for a in save_aliases)
+
+                if original_alias != new_alias:
+                    self.bot.aliases[alias] = new_alias
+                    edited[alias] = original_alias
+
+        return deleted, edited
 
     @commands.hybrid_command(usage="<category> [options]")
     @checks.has_permissions(PermissionLevel.MODERATOR)
@@ -1573,29 +1591,18 @@ class Modmail(commands.Cog):
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
-    @commands.hybrid_group(invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(user="Member to view logs for")
-    @app_commands.autocomplete(user=log_recipient_autocomplete)
-    async def logs(self, ctx, user: Optional[str] = None):
-        """
-        Get previous Modmail thread logs of a member.
-
-        Leave `user` blank when this command is used within a
-        thread channel to show logs for the current recipient.
-        `user` may be a user ID, mention, or name.
-        """
-
+    async def _logs_view(self, ctx, user: Optional[str] = None):
+        """Show previous Modmail logs for a member."""
         async with safe_typing(ctx):
             pass
 
-        if ctx.interaction is not None and user is not None:
+        if user is not None and isinstance(user, str):
             user = await self._resolve_log_user(ctx, user)
 
         if not user:
             thread = ctx.thread
             if not thread:
-                raise commands.MissingRequiredArgument(DummyParam("user"))
+                return await ctx.send_error("Missing required `user` outside of a Modmail thread.")
             user = thread.recipient or await self.bot.get_or_fetch_user(thread.id)
 
         default_avatar = "https://cdn.discordapp.com/embed/avatars/0.png"
@@ -1617,18 +1624,9 @@ class Modmail(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @logs.command(name="closed-by", aliases=["closeby"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(user="Staff member who closed the logs")
-    @app_commands.autocomplete(user=guild_member_autocomplete)
-    async def logs_closed_by(self, ctx, user: Optional[str] = None):
-        """
-        Get all logs closed by the specified user.
-
-        If no `user` is provided, the user will be the person who sent this command.
-        `user` may be a user ID, mention, or name.
-        """
-        if ctx.interaction is not None and user is not None:
+    async def _logs_closed_by(self, ctx, user: Optional[str] = None):
+        """Show logs closed by a staff member."""
+        if user is not None and isinstance(user, str):
             user = await self._resolve_guild_member(ctx, user)
         user = user if user is not None else ctx.author
 
@@ -1645,14 +1643,8 @@ class Modmail(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @logs.command(name="key", aliases=["id"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(key="Log key to look up")
-    @app_commands.autocomplete(key=log_key_autocomplete)
-    async def logs_key(self, ctx, key: str):
-        """
-        Get the log link for the specified log key.
-        """
+    async def _logs_key(self, ctx, key: str):
+        """Look up a log entry by key."""
         icon_url = ctx.author.avatar.url
 
         logs = await self.bot.api.find_log_entry(key)
@@ -1669,14 +1661,8 @@ class Modmail(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @logs.command(name="delete", aliases=["wipe"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(key_or_link="Log key or log URL to delete")
-    @app_commands.autocomplete(key_or_link=log_key_autocomplete)
-    async def logs_delete(self, ctx, key_or_link: str):
-        """
-        Wipe a log entry from the database.
-        """
+    async def _logs_delete(self, ctx, key_or_link: str):
+        """Delete a log entry from the database."""
         key = key_or_link.split("/")[-1]
 
         success = await self.bot.api.delete_log_entry(key)
@@ -1696,18 +1682,9 @@ class Modmail(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @logs.command(name="responded")
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(user="Staff member who responded in the logs")
-    @app_commands.autocomplete(user=guild_member_autocomplete)
-    async def logs_responded(self, ctx, user: Optional[str] = None):
-        """
-        Get all logs where the specified user has responded at least once.
-
-        If no `user` is provided, the user will be the person who sent this command.
-        `user` may be a user ID, mention, or name.
-        """
-        if ctx.interaction is not None and user is not None:
+    async def _logs_responded(self, ctx, user: Optional[str] = None):
+        """Show logs where a staff member has responded."""
+        if user is not None and isinstance(user, str):
             user = await self._resolve_guild_member(ctx, user)
         user = user if user is not None else ctx.author
 
@@ -1725,21 +1702,10 @@ class Modmail(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @logs.command(name="search", aliases=["find"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(limit="Maximum number of logs to return", query="Text to search for in log messages")
-    async def logs_search(self, ctx, limit: Optional[int] = None, query: str = ""):
-        """
-        Retrieve all logs that contain messages with your query.
-
-        Provide a `limit` to specify the maximum number of logs the bot should find.
-        """
-
+    async def _logs_search(self, ctx, query: str, limit: Optional[int] = None):
+        """Search log messages for text."""
         async with safe_typing(ctx):
             pass
-
-        if not query:
-            raise commands.MissingRequiredArgument(DummyParam("query"))
 
         entries = await self.bot.api.search_by_text(query, limit)
 
@@ -1755,214 +1721,139 @@ class Modmail(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @commands.hybrid_command()
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def reply(self, ctx, *, msg: str = ""):
-        """
-        Reply to a Modmail thread.
+    @app_commands.command(name="logs", description="View and manage Modmail thread logs.")
+    @app_commands.describe(
+        action="Log action to perform",
+        user="Member or staff user for the selected action",
+        key="Log key or URL",
+        query="Text to search for in log messages",
+        limit="Maximum number of logs to return",
+    )
+    @app_commands.autocomplete(
+        action=logs_action_autocomplete,
+        user=log_recipient_autocomplete,
+        key=log_key_autocomplete,
+    )
+    @checks.slash_has_permissions(PermissionLevel.SUPPORTER)
+    async def logs_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        user: str = "",
+        key: str = "",
+        query: str = "",
+        limit: Optional[int] = None,
+    ):
+        """Dispatch merged slash log actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, LOGS_ACTIONS, command_name="logs"):
+            return
 
-        Supports attachments and images as well as
-        automatically embedding image URLs.
-        """
+        if action == "delete":
+            if not await self._ensure_permission_level(ctx, PermissionLevel.OWNER):
+                return
 
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
+        await ctx.defer()
+
+        if action == "view":
+            resolved_user = user or None
+            return await self._logs_view(ctx, resolved_user)
+        if action == "closed_by":
+            resolved_user = user or None
+            return await self._logs_closed_by(ctx, resolved_user)
+        if action == "key":
+            if await slash_dispatch.reject_missing(interaction, key, "key", for_action=action):
+                return
+            return await self._logs_key(ctx, key)
+        if action == "delete":
+            if await slash_dispatch.reject_missing(interaction, key, "key", for_action=action):
+                return
+            return await self._logs_delete(ctx, key)
+        if action == "responded":
+            resolved_user = user or None
+            return await self._logs_responded(ctx, resolved_user)
+        if action == "search":
+            if await slash_dispatch.reject_missing(interaction, query, "query", for_action=action):
+                return
+            return await self._logs_search(ctx, query, limit)
+
+    async def _dispatch_reply(self, ctx, mode: str, msg: str):
+        """Send a thread reply using the selected reply mode."""
+        anonymous = mode in ("anonymous", "plain_anonymous", "format_anonymous", "format_plain_anonymous")
+        plain = mode in ("plain", "plain_anonymous", "format_plain", "format_plain_anonymous")
+        if mode.startswith("format"):
+            msg = self.bot.formatter.format(
+                msg,
+                channel=ctx.channel,
+                recipient=ctx.thread.recipient,
+                author=ctx.message.author,
+            )
+
+        ctx.set_message_content(msg)
         async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg)
+            await ctx.thread.reply(ctx.message, msg, anonymous=anonymous, plain=plain)
 
-    @commands.hybrid_command(aliases=["formatreply"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def freply(self, ctx, *, msg: str = ""):
-        """
-        Reply to a Modmail thread with variables.
-
-        Works just like `{prefix}reply`, however with the addition of three variables:
-          - `{{channel}}` - the `discord.TextChannel` object
-          - `{{recipient}}` - the `discord.User` object of the recipient
-          - `{{author}}` - the `discord.User` object of the author
-
-        Supports attachments and images as well as
-        automatically embedding image URLs.
-        """
-        msg = self.bot.formatter.format(
-            msg,
-            channel=ctx.channel,
-            recipient=ctx.thread.recipient,
-            author=ctx.message.author,
+    @app_commands.command(name="reply", description="Reply to a Modmail thread.")
+    @app_commands.describe(
+        mode="Reply mode",
+        message="Message to send to the recipient",
+        attachment="Optional attachment to include",
+    )
+    @app_commands.autocomplete(mode=reply_mode_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.SUPPORTER)
+    async def reply_slash(
+        self,
+        interaction: discord.Interaction,
+        mode: str,
+        message: str = "",
+        attachment: Optional[discord.Attachment] = None,
+    ):
+        """Dispatch merged slash reply modes."""
+        attachments = [attachment] if attachment is not None else []
+        ctx = await checks.InteractionContext.from_interaction(
+            interaction, content=message, attachments=attachments
         )
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
+        if ctx.thread is None:
+            return await ctx.send_error("This is not a Modmail thread.")
+        if await slash_dispatch.reject_action(interaction, mode, REPLY_MODES, command_name="reply"):
+            return
+        if not message and not attachments:
+            return await ctx.send_error("Provide a `message` or `attachment`.")
+        await self._dispatch_reply(ctx, mode, message)
+
+    async def _dispatch_note(self, ctx, msg: str, *, persistent: bool = False, slash: bool = False):
+        """Take a normal or persistent note on the current thread."""
+        ctx.set_message_content(msg)
         async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg)
+            note_message = await ctx.thread.note(ctx.message, persistent=persistent)
+            await note_message.pin()
+        if persistent:
+            await self.bot.api.create_note(
+                recipient=ctx.thread.recipient, message=ctx.message, message_id=note_message.id
+            )
+        if not slash:
+            sent_emoji, _ = await self.bot.retrieve_emoji()
+            await self.bot.add_reaction(ctx.message, sent_emoji)
+            try:
+                await ctx.message.delete(delay=3)
+            except (discord.Forbidden, discord.NotFound):
+                pass
 
-    @commands.hybrid_command(aliases=["formatanonreply"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def fareply(self, ctx, *, msg: str = ""):
-        """
-        Anonymously reply to a Modmail thread with variables.
-
-        Works just like `{prefix}areply`, however with the addition of three variables:
-          - `{{channel}}` - the `discord.TextChannel` object
-          - `{{recipient}}` - the `discord.User` object of the recipient
-          - `{{author}}` - the `discord.User` object of the author
-
-        Supports attachments and images as well as
-        automatically embedding image URLs.
-        """
-        msg = self.bot.formatter.format(
-            msg,
-            channel=ctx.channel,
-            recipient=ctx.thread.recipient,
-            author=ctx.message.author,
-        )
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg, anonymous=True)
-
-    @commands.hybrid_command(aliases=["formatplainreply"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def fpreply(self, ctx, *, msg: str = ""):
-        """
-        Reply to a Modmail thread with variables and a plain message.
-
-        Works just like `{prefix}areply`, however with the addition of three variables:
-          - `{{channel}}` - the `discord.TextChannel` object
-          - `{{recipient}}` - the `discord.User` object of the recipient
-          - `{{author}}` - the `discord.User` object of the author
-
-        Supports attachments and images as well as
-        automatically embedding image URLs.
-        """
-        msg = self.bot.formatter.format(
-            msg,
-            channel=ctx.channel,
-            recipient=ctx.thread.recipient,
-            author=ctx.message.author,
-        )
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg, plain=True)
-
-    @commands.hybrid_command(aliases=["formatplainanonreply"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def fpareply(self, ctx, *, msg: str = ""):
-        """
-        Anonymously reply to a Modmail thread with variables and a plain message.
-
-        Works just like `{prefix}areply`, however with the addition of three variables:
-          - `{{channel}}` - the `discord.TextChannel` object
-          - `{{recipient}}` - the `discord.User` object of the recipient
-          - `{{author}}` - the `discord.User` object of the author
-
-        Supports attachments and images as well as
-        automatically embedding image URLs.
-        """
-        msg = self.bot.formatter.format(
-            msg,
-            channel=ctx.channel,
-            recipient=ctx.thread.recipient,
-            author=ctx.message.author,
-        )
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg, anonymous=True, plain=True)
-
-    @commands.hybrid_command(aliases=["anonreply", "anonymousreply"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def areply(self, ctx, *, msg: str = ""):
-        """
-        Reply to a thread anonymously.
-
-        You can edit the anonymous user's name,
-        avatar and tag using the config command.
-
-        Edit the `anon_username`, `anon_avatar_url`
-        and `anon_tag` config variables to do so.
-        """
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg, anonymous=True)
-
-    @commands.hybrid_command(aliases=["plainreply"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def preply(self, ctx, *, msg: str = ""):
-        """
-        Reply to a Modmail thread with a plain message.
-
-        Supports attachments and images as well as
-        automatically embedding image URLs.
-        """
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg, plain=True)
-
-    @commands.hybrid_command(aliases=["plainanonreply", "plainanonymousreply"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def pareply(self, ctx, *, msg: str = ""):
-        """
-        Reply to a Modmail thread with a plain message and anonymously.
-
-        Supports attachments and images as well as
-        automatically embedding image URLs.
-        """
-        # Ensure logs record only the reply text, not the command.
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            await ctx.thread.reply(ctx.message, msg, anonymous=True, plain=True)
-
-    @commands.hybrid_group(invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def note(self, ctx, *, msg: str = ""):
-        """
-        Take a note about the current thread.
-
-        Useful for noting context.
-        """
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            msg = await ctx.thread.note(ctx.message)
-            await msg.pin()
-        # Acknowledge and clean up the invoking command message
-        sent_emoji, _ = await self.bot.retrieve_emoji()
-        await self.bot.add_reaction(ctx.message, sent_emoji)
-        try:
-            await ctx.message.delete(delay=3)
-        except (discord.Forbidden, discord.NotFound):
-            pass
-
-    @note.command(name="persistent", aliases=["persist"])
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    async def note_persistent(self, ctx, *, msg: str = ""):
-        """
-        Take a persistent note about the current user.
-        """
-        ctx.message.content = msg
-        async with safe_typing(ctx):
-            msg = await ctx.thread.note(ctx.message, persistent=True)
-            await msg.pin()
-        await self.bot.api.create_note(recipient=ctx.thread.recipient, message=ctx.message, message_id=msg.id)
-        # Acknowledge and clean up the invoking command message
-        sent_emoji, _ = await self.bot.retrieve_emoji()
-        await self.bot.add_reaction(ctx.message, sent_emoji)
-        try:
-            await ctx.message.delete(delay=3)
-        except (discord.Forbidden, discord.NotFound) as e:
-            logger.debug(f"Failed to delete note command message: {e}")
+    @app_commands.command(name="note", description="Take a note about the current thread.")
+    @app_commands.describe(action="Note type", message="Note content")
+    @app_commands.autocomplete(action=note_action_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.SUPPORTER)
+    async def note_slash(self, interaction: discord.Interaction, action: str, message: str = ""):
+        """Dispatch merged slash note actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction, content=message)
+        if ctx.thread is None:
+            return await ctx.send_error("This is not a Modmail thread.")
+        if await slash_dispatch.reject_action(interaction, action, NOTE_ACTIONS, command_name="note"):
+            return
+        if action == "normal":
+            return await self._dispatch_note(ctx, message, slash=True)
+        if action == "persistent":
+            return await self._dispatch_note(ctx, message, persistent=True, slash=True)
 
     @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
@@ -2225,19 +2116,13 @@ class Modmail(commands.Cog):
             except (discord.Forbidden, discord.NotFound):
                 pass
 
-    @commands.hybrid_group(invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @trigger_typing
-    async def blocked(self, ctx):
-        """Retrieve a list of blocked users."""
-
+    async def _blocked_list(self, ctx):
+        """List blocked users and roles."""
         roles = []
         users = []
-        now = ctx.message.created_at
 
         blocked_users = list(self.bot.blocked_users.items())
         for id_, reason in blocked_users:
-            # parse "reason" and check if block is expired
             try:
                 end_time, after = extract_block_timestamp(reason, id_)
             except ValueError:
@@ -2245,7 +2130,6 @@ class Modmail(commands.Cog):
 
             if end_time is not None:
                 if after <= 0:
-                    # No longer blocked
                     self.bot.blocked_users.pop(str(id_))
                     logger.debug("No longer blocked, user %s.", id_)
                     continue
@@ -2253,8 +2137,6 @@ class Modmail(commands.Cog):
 
         blocked_roles = list(self.bot.blocked_roles.items())
         for id_, reason in blocked_roles:
-            # parse "reason" and check if block is expired
-            # etc "blah blah blah... until 2019-10-14T21:12:45.559948."
             try:
                 end_time, after = extract_block_timestamp(reason, id_)
             except ValueError:
@@ -2262,7 +2144,6 @@ class Modmail(commands.Cog):
 
             if end_time is not None:
                 if after <= 0:
-                    # No longer blocked
                     self.bot.blocked_roles.pop(str(id_))
                     logger.debug("No longer blocked, role %s.", id_)
                     continue
@@ -2322,18 +2203,9 @@ class Modmail(commands.Cog):
 
         await session.run()
 
-    @blocked.command(name="whitelist")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @trigger_typing
-    @app_commands.describe(user="User to whitelist or un-whitelist from blocking")
-    @app_commands.autocomplete(user=log_recipient_autocomplete)
-    async def blocked_whitelist(self, ctx, user: Optional[str] = None):
-        """
-        Whitelist or un-whitelist a user from getting blocked.
-
-        Useful for preventing users from getting blocked by account_age/guild_age restrictions.
-        """
-        if ctx.interaction is not None and user is not None:
+    async def _blocked_whitelist(self, ctx, user: Optional[str] = None):
+        """Whitelist or un-whitelist a user from blocking."""
+        if user is not None and isinstance(user, str):
             user = await self._resolve_log_user(ctx, user)
 
         if user is None:
@@ -2341,7 +2213,7 @@ class Modmail(commands.Cog):
             if thread:
                 user = thread.recipient
             else:
-                return await ctx.send_help(ctx.command)
+                return await ctx.send_error("Missing required `user_or_role` outside of a Modmail thread.")
 
         mention = getattr(user, "mention", f"`{user.id}`")
         msg = ""
@@ -2364,8 +2236,6 @@ class Modmail(commands.Cog):
         await self.bot.config.update()
 
         if msg.startswith("System Message: "):
-            # If the user is blocked internally (for example: below minimum account age)
-            # Show an extended message stating the original internal message
             reason = msg[16:].strip().rstrip(".")
             embed = discord.Embed(
                 title="Success",
@@ -2382,43 +2252,30 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.hybrid_command(usage="[user] [duration] [reason]")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @trigger_typing
-    @app_commands.describe(
-        user_or_role="User or role to block",
-        after="Duration until auto-unblock (e.g. 2h) and optional reason",
-    )
-    @app_commands.autocomplete(user_or_role=member_role_autocomplete)
-    async def block(
+    async def _blocked_block(
         self,
         ctx,
-        user_or_role: Optional[str] = None,
-        *,
-        after: UserFriendlyTime = None,
+        user_or_role,
+        duration: str = "",
+        reason_text: str = "",
     ):
-        """
-        Block a user or role from using Modmail.
-
-        You may choose to set a time as to when the user will automatically be unblocked.
-
-        Leave `user` blank when this command is used within a
-        thread channel to block the current recipient.
-        `user` may be a user ID, mention, or name.
-        `duration` may be a simple "human-readable" time text. See `{prefix}help close` for examples.
-        """
-
-        if user_or_role is not None:
+        """Block a user or role from using Modmail."""
+        if user_or_role is not None and isinstance(user_or_role, str):
             user_or_role = await self._resolve_notify_target(ctx, user_or_role)
+
+        after = None
+        if duration:
+            combined = f"{duration} {reason_text}".strip()
+            after = await UserFriendlyTime().convert(ctx, combined)
 
         if user_or_role is None:
             thread = ctx.thread
             if thread:
                 user_or_role = thread.recipient
             elif after is None:
-                raise commands.MissingRequiredArgument(DummyParam("user or role"))
+                return await ctx.send_error("Missing required `user_or_role`.")
             else:
-                raise commands.BadArgument(f'User or role "{after.arg}" not found.')
+                return await ctx.send_error(f'User or role "{after.arg}" not found.')
 
         mention = getattr(user_or_role, "mention", f"`{user_or_role.id}`")
 
@@ -2437,7 +2294,7 @@ class Modmail(commands.Cog):
 
         if after is not None:
             if "%" in reason:
-                raise commands.BadArgument('The reason contains illegal character "%".')
+                return await ctx.send_error('The reason contains illegal character "%".')
 
             if after.arg:
                 fmt_dt = discord.utils.format_dt(after.dt, "R")
@@ -2479,21 +2336,9 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.hybrid_command()
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @trigger_typing
-    @app_commands.describe(user_or_role="User or role to unblock")
-    @app_commands.autocomplete(user_or_role=member_role_autocomplete)
-    async def unblock(self, ctx, user_or_role: Optional[str] = None):
-        """
-        Unblock a user from using Modmail.
-
-        Leave `user` blank when this command is used within a
-        thread channel to unblock the current recipient.
-        `user` may be a user ID, mention, or name.
-        """
-
-        if user_or_role is not None:
+    async def _blocked_unblock(self, ctx, user_or_role: Optional[str] = None):
+        """Unblock a user or role."""
+        if user_or_role is not None and isinstance(user_or_role, str):
             user_or_role = await self._resolve_notify_target(ctx, user_or_role)
 
         if user_or_role is None:
@@ -2501,7 +2346,7 @@ class Modmail(commands.Cog):
             if thread:
                 user_or_role = thread.recipient
             else:
-                raise commands.MissingRequiredArgument(DummyParam("user or role"))
+                return await ctx.send_error("Missing required `user_or_role`.")
 
         mention = getattr(user_or_role, "mention", f"`{user_or_role.id}`")
         name = getattr(user_or_role, "name", f"`{user_or_role.id}`")
@@ -2511,8 +2356,6 @@ class Modmail(commands.Cog):
             await self.bot.config.update()
 
             if msg.startswith("System Message: "):
-                # If the user is blocked internally (for example: below minimum account age)
-                # Show an extended message stating the original internal message
                 reason = msg[16:].strip().rstrip(".") or "no reason"
                 embed = discord.Embed(
                     title="Success",
@@ -2523,7 +2366,7 @@ class Modmail(commands.Cog):
                 embed.set_footer(
                     text="However, if the original system block reason still applies, "
                     f"{name} will be automatically blocked again. "
-                    f'Use "{self.bot.prefix}blocked whitelist {user_or_role.id}" to whitelist the user.'
+                    f'Use "/blocked" with action `whitelist` to whitelist the user.'
                 )
             else:
                 embed = discord.Embed(
@@ -2532,7 +2375,7 @@ class Modmail(commands.Cog):
                     description=f"{mention} is no longer blocked.",
                 )
         elif isinstance(user_or_role, discord.Role) and str(user_or_role.id) in self.bot.blocked_roles:
-            msg = self.bot.blocked_roles.pop(str(user_or_role.id)) or ""
+            self.bot.blocked_roles.pop(str(user_or_role.id)) or ""
             await self.bot.config.update()
 
             embed = discord.Embed(
@@ -2548,6 +2391,42 @@ class Modmail(commands.Cog):
             )
 
         return await ctx.send(embed=embed)
+
+    @app_commands.command(name="blocked", description="Manage blocked Modmail users and roles.")
+    @app_commands.describe(
+        action="Blocked-list action to perform",
+        user_or_role="User or role target",
+        duration="Auto-unblock duration (e.g. 2h, 1d)",
+        reason="Optional block reason",
+    )
+    @app_commands.autocomplete(action=blocked_action_autocomplete, user_or_role=member_role_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.MODERATOR)
+    async def blocked_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        user_or_role: str = "",
+        duration: str = "",
+        reason: str = "",
+    ):
+        """Dispatch merged slash blocked actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, BLOCKED_ACTIONS, command_name="blocked"):
+            return
+
+        await ctx.defer()
+
+        if action == "list":
+            return await self._blocked_list(ctx)
+        if action == "whitelist":
+            target = user_or_role or None
+            return await self._blocked_whitelist(ctx, target)
+        if action == "block":
+            target = user_or_role or None
+            return await self._blocked_block(ctx, target, duration, reason)
+        if action == "unblock":
+            target = user_or_role or None
+            return await self._blocked_unblock(ctx, target)
 
     @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
@@ -2695,14 +2574,8 @@ class Modmail(commands.Cog):
                 logger.info("Multiple users with the same name and discriminator.")
         return await self.bot.add_reaction(ctx.message, blocked_emoji)
 
-    @commands.hybrid_command()
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def enable(self, ctx):
-        """
-        Re-enables DM functionalities of Modmail.
-
-        Undo's the `{prefix}disable` command, all DM will be relayed after running this command.
-        """
+    async def _control_enable(self, ctx):
+        """Re-enable all Modmail DM functionality."""
         embed = discord.Embed(
             title="Success",
             description="Modmail will now accept all DM messages.",
@@ -2715,26 +2588,8 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.hybrid_group(invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def disable(self, ctx):
-        """
-        Disable partial or full Modmail thread functions.
-
-        To stop all new threads from being created, do `{prefix}disable new`.
-        To stop all existing threads from DMing Modmail, do `{prefix}disable all`.
-        To check if the DM function for Modmail is enabled, do `{prefix}isenable`.
-        """
-        await ctx.send_help(ctx.command)
-
-    @disable.command(name="new")
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def disable_new(self, ctx):
-        """
-        Stop accepting new Modmail threads.
-
-        No new threads can be created through DM.
-        """
+    async def _control_disable_new(self, ctx):
+        """Disable creation of new Modmail threads."""
         embed = discord.Embed(
             title="Success",
             description="Modmail will not create any new threads.",
@@ -2746,14 +2601,8 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @disable.command(name="all")
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def disable_all(self, ctx):
-        """
-        Disables all DM functionalities of Modmail.
-
-        No new threads can be created through DM nor no further DM messages will be relayed.
-        """
+    async def _control_disable_all(self, ctx):
+        """Disable all Modmail DM functionality."""
         embed = discord.Embed(
             title="Success",
             description="Modmail will not accept any DM messages.",
@@ -2766,13 +2615,8 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.hybrid_command()
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def isenable(self, ctx):
-        """
-        Check if the DM functionalities of Modmail is enabled.
-        """
-
+    async def _control_status(self, ctx):
+        """Show whether Modmail DM functionality is enabled."""
         if self.bot.config["dm_disabled"] == DMDisabled.NEW_THREADS:
             embed = discord.Embed(
                 title="New Threads Disabled",
@@ -2794,35 +2638,49 @@ class Modmail(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @commands.hybrid_command(usage="[duration]")
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @checks.thread_only()
-    @app_commands.describe(duration="How long to snooze (e.g. 2d, 12h)")
-    async def snooze(self, ctx, *, duration: UserFriendlyTime = None):
-        """
-        Snooze this thread. Behavior depends on config:
-        - delete (default): deletes the channel and restores it later
-        - move: moves the channel to the configured snoozed category
-            Optionally specify a duration, e.g. 'snooze 2d' for 2 days.
-            Uses config: snooze_default_duration, snooze_title, snooze_text
-        """
+    @app_commands.command(name="control", description="Enable, disable, or check Modmail DM functionality.")
+    @app_commands.describe(action="Control action to perform")
+    @app_commands.autocomplete(action=control_action_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def control_slash(self, interaction: discord.Interaction, action: str):
+        """Dispatch merged slash control actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, CONTROL_ACTIONS, command_name="control"):
+            return
+
+        if action == "enable":
+            return await self._control_enable(ctx)
+        if action == "disable_new":
+            return await self._control_disable_new(ctx)
+        if action == "disable_all":
+            return await self._control_disable_all(ctx)
+        if action == "status":
+            return await self._control_status(ctx)
+
+    async def _snooze_seconds_from_config(self, ctx, duration: str = "") -> int:
+        """Resolve snooze duration in seconds from slash input or config default."""
+        try:
+            default_snooze = int(self.bot.config.get("snooze_default_duration", 604800))
+        except (ValueError, TypeError):
+            default_snooze = 604800
+
+        if not duration:
+            return default_snooze
+
+        parsed = await UserFriendlyTime().convert(ctx, duration)
+        snooze_for = int((parsed.dt - parsed.now).total_seconds())
+        return min(snooze_for, default_snooze)
+
+    async def _dispatch_snooze(self, ctx, duration: str = ""):
+        """Snooze the current thread using configured behavior."""
         thread = ctx.thread
         if thread.snoozed:
             await ctx.send("This thread is already snoozed.")
             logging.info(f"[SNOOZE] Thread for {getattr(thread.recipient, 'id', None)} already snoozed.")
             return
-        # Default snooze duration with safe fallback
-        try:
-            default_snooze = int(self.bot.config.get("snooze_default_duration", 604800))
-        except (ValueError, TypeError):
-            default_snooze = 604800
-        if duration:
-            snooze_for = int((duration.dt - duration.now).total_seconds())
-            snooze_for = min(snooze_for, default_snooze)
-        else:
-            snooze_for = default_snooze
 
-        # Capacity pre-check: if behavior is move, ensure snoozed category has room (<49 channels)
+        snooze_for = await self._snooze_seconds_from_config(ctx, duration)
+
         behavior = (self.bot.config.get("snooze_behavior") or "delete").lower()
         if behavior == "move":
             snoozed_cat_id = self.bot.config.get("snoozed_category_id")
@@ -2832,11 +2690,9 @@ class Modmail(commands.Cog):
                     target_category = self.bot.modmail_guild.get_channel(int(snoozed_cat_id))
                 except Exception:
                     target_category = None
-            # Auto-create snoozed category if missing
             if not isinstance(target_category, discord.CategoryChannel):
                 try:
                     logging.info("Auto-creating snoozed category for move-based snoozing.")
-                    # Hide category by default; only bot can view/manage
                     overwrites = {
                         self.bot.modmail_guild.default_role: discord.PermissionOverwrite(view_channel=False)
                     }
@@ -2893,7 +2749,6 @@ class Modmail(commands.Cog):
                         )
                     )
                     logging.warning("Failed to auto-create snoozed category: %s", e)
-            # Capacity check after ensuring category exists
             if isinstance(target_category, discord.CategoryChannel):
                 try:
                     if len(target_category.channels) >= 49:
@@ -2911,7 +2766,6 @@ class Modmail(commands.Cog):
                 except Exception as e:
                     logging.debug("Failed to check snoozed category channel count: %s", e)
 
-        # Store snooze_until timestamp for reliable auto-unsnooze
         now = datetime.now(timezone.utc)
         snooze_until = now + timedelta(seconds=snooze_for)
         await self.bot.api.logs.update_one(
@@ -2940,21 +2794,12 @@ class Modmail(commands.Cog):
             await ctx.send("Failed to snooze this thread.")
             logging.error(f"[SNOOZE] Failed to snooze thread for {getattr(thread.recipient, 'id', None)}.")
 
-    @commands.hybrid_command()
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @app_commands.describe(user="User to unsnooze (defaults to current thread recipient)")
-    @app_commands.autocomplete(user=log_recipient_autocomplete)
-    async def unsnooze(self, ctx, user: Optional[str] = None):
-        """
-        Unsnooze a thread: restores the channel and replays messages.
-        You can specify a user by mention or ID, or run in a thread channel to unsnooze that thread.
-        Uses config: unsnooze_text
-        """
-        if ctx.interaction is not None and user is not None:
+    async def _dispatch_unsnooze(self, ctx, user: Optional[str] = None):
+        """Unsnooze a thread by user or current channel."""
+        if user is not None and isinstance(user, str):
             user = await self._resolve_log_user(ctx, user)
 
         thread = None
-        user_obj = None
         if user is not None:
             user_obj = user
             if isinstance(user_obj, discord.Object):
@@ -2964,7 +2809,7 @@ class Modmail(commands.Cog):
                 await ctx.send(f"[DEBUG] No thread found for user {user} (obj: {user_obj}).")
                 logging.warning(f"[UNSNOOZE] No thread found for user {user} (obj: {user_obj})")
                 return
-        elif hasattr(ctx, "thread") and ctx.thread:
+        elif ctx.thread:
             thread = ctx.thread
         else:
             await ctx.send("This is not a Modmail thread.")
@@ -2975,7 +2820,6 @@ class Modmail(commands.Cog):
             logging.info(f"[UNSNOOZE] Thread for {getattr(thread.recipient, 'id', None)} is not snoozed.")
             return
 
-        # Manually fetch snooze_data if the thread object doesn't have it
         if not thread.snooze_data:
             log_entry = await self.bot.api.logs.find_one({"recipient.id": str(thread.id), "snoozed": True})
             if log_entry:
@@ -2994,19 +2838,14 @@ class Modmail(commands.Cog):
                 f"[UNSNOOZE] Failed to unsnooze thread for {getattr(thread.recipient, 'id', None)}."
             )
 
-    @commands.hybrid_command()
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def snoozed(self, ctx):
-        """
-        List all currently snoozed threads/users.
-        """
+    async def _snooze_list(self, ctx):
+        """List all currently snoozed threads."""
         snoozed_threads = [thread for thread in self.bot.threads.cache.values() if thread.snoozed]
         if not snoozed_threads:
             await ctx.send("No threads are currently snoozed.")
             return
 
         lines = []
-        now = datetime.now(timezone.utc)
         for thread in snoozed_threads:
             user = thread.recipient.name if thread.recipient else "Unknown"
             user_id = thread.id
@@ -3021,7 +2860,7 @@ class Modmail(commands.Cog):
                 if since:
                     try:
                         since_dt = datetime.fromisoformat(since)
-                        since_str = f"<t:{int(since_dt.timestamp())}:R>"  # Discord relative timestamp
+                        since_str = f"<t:{int(since_dt.timestamp())}:R>"
                     except (ValueError, TypeError) as e:
                         logging.warning(f"[SNOOZED] Invalid snooze_start for {user_id}: {since} ({e})")
                 else:
@@ -3039,6 +2878,91 @@ class Modmail(commands.Cog):
             lines.append(f"- {user} (`{user_id}`) since {since_str}, until {until_str}")
 
         await ctx.send("Snoozed threads:\n" + "\n".join(lines))
+
+    async def _snooze_clear(self, ctx):
+        """Unsnooze all snoozed threads after confirmation."""
+        snoozed = await self.bot.api.logs.find({"snoozed": True}).to_list(None)
+        if not snoozed:
+            await ctx.send("No threads are currently snoozed.")
+            return
+        lines = []
+        for entry in snoozed:
+            user = entry.get("recipient", {}).get("name", "Unknown")
+            user_id = entry.get("recipient", {}).get("id", "?")
+            lines.append(f"- {user} (`{user_id}`)")
+        await ctx.send(
+            "The following threads are currently snoozed and will be unsnoozed if you confirm:\n"
+            + "\n".join(lines)
+            + "\n\nType `yes` to confirm, or anything else to cancel."
+        )
+
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            reply = await ctx.wait_for("message", check=check, timeout=30)
+        except asyncio.TimeoutError:
+            await ctx.send("Timed out. No threads were unsnoozed.")
+            return
+        if reply.content.strip().lower() != "yes":
+            await ctx.send("Cancelled. No threads were unsnoozed.")
+            return
+        count = 0
+        for entry in snoozed:
+            user_id = entry.get("recipient", {}).get("id")
+            if not user_id:
+                continue
+            thread = await self.bot.threads.find(recipient_id=int(user_id))
+            if thread and thread.snoozed:
+                ok = await thread.restore_from_snooze()
+                if ok:
+                    self.bot.threads.cache[thread.id] = thread
+                    count += 1
+        await ctx.send(f"Unsnoozed {count} thread(s).")
+
+    @app_commands.command(name="snooze", description="Snooze, unsnooze, or list snoozed threads.")
+    @app_commands.describe(
+        action="Snooze action to perform",
+        duration="How long to snooze (defaults to config)",
+        user="User to unsnooze",
+    )
+    @app_commands.autocomplete(
+        action=snooze_action_autocomplete,
+        duration=snooze_duration_autocomplete,
+        user=log_recipient_autocomplete,
+    )
+    @checks.slash_has_permissions(PermissionLevel.SUPPORTER)
+    async def snooze_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        duration: str = "",
+        user: str = "",
+    ):
+        """Dispatch merged slash snooze actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, SNOOZE_ACTIONS, command_name="snooze"):
+            return
+
+        if action == "clear":
+            if not await self._ensure_permission_level(ctx, PermissionLevel.OWNER):
+                return
+
+        if action == "snooze":
+            if ctx.thread is None:
+                return await ctx.send_error("This is not a Modmail thread.")
+            await ctx.defer()
+            return await self._dispatch_snooze(ctx, duration)
+
+        await ctx.defer()
+
+        if action == "unsnooze":
+            target = user or None
+            return await self._dispatch_unsnooze(ctx, target)
+        if action == "list":
+            return await self._snooze_list(ctx)
+        if action == "clear":
+            return await self._snooze_clear(ctx)
 
     async def cog_load(self):
         guilds = self._guilds()
@@ -3069,67 +2993,6 @@ class Modmail(commands.Cog):
     @snooze_auto_unsnooze.before_loop
     async def _snooze_auto_unsnooze_before(self):
         await self.bot.wait_until_ready()
-
-    async def process_dm_modmail(self, message: discord.Message) -> None:
-        # ... existing code ...
-        # Before processing, check if thread is snoozed and auto-unsnooze
-        thread = await self.threads.find(recipient=message.author)
-        if thread and thread.snoozed:
-            await thread.restore_from_snooze()
-            # Ensure the thread object in the cache is updated with the new channel
-            self.threads.cache[thread.id] = thread
-        # ... rest of the method unchanged ...
-
-    @commands.hybrid_command()
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def clearsnoozed(self, ctx):
-        """
-        List all snoozed threads and ask for confirmation before clearing (unsnoozing) all of them.
-        Only proceed if the user confirms.
-        """
-        snoozed = await self.bot.api.logs.find({"snoozed": True}).to_list(None)
-        if not snoozed:
-            await ctx.send("No threads are currently snoozed.")
-            return
-        lines = []
-        for entry in snoozed:
-            user = entry.get("recipient", {}).get("name", "Unknown")
-            user_id = entry.get("recipient", {}).get("id", "?")
-            lines.append(f"- {user} (`{user_id}`)")
-        msg = await ctx.send(
-            "The following threads are currently snoozed and will be unsnoozed if you confirm:\n"
-            + "\n".join(lines)
-            + "\n\nType `yes` to confirm, or anything else to cancel."
-        )
-
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel
-
-        try:
-            reply = await self.bot.wait_for("message", check=check, timeout=30)
-        except asyncio.TimeoutError:
-            await ctx.send("Timed out. No threads were unsnoozed.")
-            return
-        if reply.content.strip().lower() != "yes":
-            await ctx.send("Cancelled. No threads were unsnoozed.")
-            return
-        count = 0
-        for entry in snoozed:
-            user_id = entry.get("recipient", {}).get("id")
-            if not user_id:
-                continue
-            user_obj = None
-            try:
-                user_obj = await self.bot.get_or_fetch_user(int(user_id))
-            except Exception:
-                user_obj = discord.Object(int(user_id))
-            thread = await self.bot.threads.find(recipient=user_obj)
-            if thread and thread.snoozed:
-                ok = await thread.restore_from_snooze()
-                if ok:
-                    self.bot.threads.cache[thread.id] = thread
-                    count += 1
-        await ctx.send(f"Unsnoozed {count} threads.")
 
 
 async def setup(bot):

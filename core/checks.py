@@ -6,6 +6,116 @@ from core.models import HostingMethod, PermissionLevel, getLogger
 logger = getLogger(__name__)
 
 
+class _SlashMessage:
+    """Minimal message stand-in for slash handlers that call thread.reply(ctx.message, ...)."""
+
+    __slots__ = ("author", "channel", "content", "attachments", "guild", "id", "created_at")
+
+    def __init__(
+        self,
+        interaction: discord.Interaction,
+        content: str = "",
+        attachments: list | None = None,
+    ):
+        self.author = interaction.user
+        self.channel = interaction.channel
+        self.guild = interaction.guild
+        self.content = content
+        self.attachments = attachments or []
+        self.id = interaction.id
+        self.created_at = discord.utils.utcnow()
+
+    async def delete(self, *, delay=None):
+        return
+
+    async def add_reaction(self, emoji):
+        return
+
+
+class InteractionContext:
+    """Context adapter for slash interactions with send, defer, and thread support."""
+
+    __slots__ = (
+        "bot",
+        "author",
+        "channel",
+        "guild",
+        "interaction",
+        "thread",
+        "_message_content",
+        "_attachments",
+    )
+
+    def __init__(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str = "",
+        attachments: list | None = None,
+        thread=None,
+    ):
+        self.interaction = interaction
+        self.bot = interaction.client
+        self.author = interaction.user
+        self.channel = interaction.channel
+        self.guild = interaction.guild
+        self.thread = thread
+        self._message_content = content
+        self._attachments = attachments or []
+
+    @classmethod
+    async def from_interaction(
+        cls,
+        interaction: discord.Interaction,
+        *,
+        content: str = "",
+        attachments: list | None = None,
+    ) -> "InteractionContext":
+        """Build a slash context and resolve the Modmail thread from the channel when possible."""
+        ctx = cls(interaction, content=content, attachments=attachments)
+        if ctx.channel is not None:
+            ctx.thread = await ctx.bot.threads.find(channel=ctx.channel)
+        return ctx
+
+    @property
+    def message(self) -> _SlashMessage:
+        return _SlashMessage(
+            self.interaction,
+            content=self._message_content,
+            attachments=self._attachments,
+        )
+
+    def set_message_content(self, content: str) -> None:
+        self._message_content = content
+
+    def set_attachments(self, attachments: list) -> None:
+        self._attachments = attachments
+
+    def typing(self):
+        if self.channel is not None:
+            return self.channel.typing()
+        return discord.utils.MISSING
+
+    async def defer(self, *, ephemeral: bool = False) -> None:
+        if not self.interaction.response.is_done():
+            await self.interaction.response.defer(ephemeral=ephemeral)
+
+    async def send(self, content=None, **kwargs):
+        if not self.interaction.response.is_done():
+            return await self.interaction.response.send_message(content, **kwargs)
+        return await self.interaction.followup.send(content, **kwargs)
+
+    async def reply(self, content=None, **kwargs):
+        return await self.send(content, **kwargs)
+
+    async def send_error(self, message: str, *, ephemeral: bool = True):
+        embed = discord.Embed(color=self.bot.error_color, description=message)
+        return await self.send(embed=embed, ephemeral=ephemeral)
+
+    def wait_for(self, event: str, *, check=None, timeout=None):
+        return self.bot.wait_for(event, check=check, timeout=timeout)
+
+
 def has_permissions_predicate(
     permission_level: PermissionLevel = PermissionLevel.REGULAR,
 ):
@@ -38,16 +148,38 @@ def has_permissions(permission_level: PermissionLevel = PermissionLevel.REGULAR)
     return commands.check(has_permissions_predicate(permission_level))
 
 
-class InteractionContext:
-    """Minimal context adapter for slash interaction permission checks."""
+async def has_at_least_permission(ctx, permission_level: PermissionLevel) -> bool:
+    """Check whether the author meets at least the given permission level."""
+    if await ctx.bot.is_owner(ctx.author) or ctx.author.id == ctx.bot.user.id:
+        return True
 
-    __slots__ = ("bot", "author", "channel", "guild")
+    if (
+        permission_level is not PermissionLevel.OWNER
+        and ctx.channel.permissions_for(ctx.author).administrator
+        and ctx.guild == ctx.bot.modmail_guild
+    ):
+        return True
 
-    def __init__(self, interaction: discord.Interaction):
-        self.bot = interaction.client
-        self.author = interaction.user
-        self.channel = interaction.channel
-        self.guild = interaction.guild
+    level_permissions = ctx.bot.config["level_permissions"]
+    checkables = {*ctx.author.roles, ctx.author}
+
+    for level in PermissionLevel:
+        if level >= permission_level and level.name in level_permissions:
+            if -1 in level_permissions[level.name] or any(
+                str(check.id) in level_permissions[level.name] for check in checkables
+            ):
+                return True
+    return False
+
+
+def slash_has_permissions(permission_level: PermissionLevel = PermissionLevel.REGULAR):
+    """Attach a permission level to a slash command callback for command_perm lookup."""
+
+    def decorator(func):
+        func.permission_level = permission_level
+        return func
+
+    return decorator
 
 
 async def check_interaction_permissions(interaction: discord.Interaction) -> bool:

@@ -24,13 +24,25 @@ from discord.ext.commands.view import StringView
 from aiohttp import ClientResponseError
 from packaging.version import Version
 
-from core import checks, utils
+from core import checks, slash_dispatch, utils
 from core.autocomplete import (
+    ALIAS_ACTIONS,
+    AUTOTRIGGER_ACTIONS,
+    CONFIG_ACTIONS,
+    DEBUG_ACTIONS,
+    OAUTH_ACTIONS,
+    PERMISSIONS_ACTIONS,
+    alias_action_autocomplete,
     alias_autocomplete,
+    autotrigger_action_autocomplete,
     command_name_autocomplete,
+    config_action_autocomplete,
     config_key_autocomplete,
+    debug_action_autocomplete,
     guild_member_autocomplete,
     guild_role_autocomplete,
+    oauth_action_autocomplete,
+    permissions_action_autocomplete,
 )
 from core.changelog import Changelog
 from core.models import (
@@ -176,19 +188,6 @@ async def mention_target_autocomplete(
     return choices[:25]
 
 
-async def permissions_get_target_autocomplete(
-    interaction: discord.Interaction, current: str
-) -> list[app_commands.Choice[str]]:
-    """Suggest members, roles, and permissions get modes."""
-    choices = []
-    current_lower = (current or "").casefold()
-    for keyword in ("command", "level", "override"):
-        if not current_lower or keyword.startswith(current_lower):
-            choices.append(app_commands.Choice(name=keyword, value=keyword))
-    choices.extend(await member_role_autocomplete(interaction, current))
-    return choices[:25]
-
-
 class ModmailHelpCommand(commands.HelpCommand):
     async def command_callback(self, ctx, *, command=None):
         """Overwrites original command_callback to ensure `help` without any arguments
@@ -281,6 +280,20 @@ class ModmailHelpCommand(commands.HelpCommand):
             embeds.extend(await self.format_cog_help(cog))
         if no_cog_commands:
             embeds.extend(await self.format_cog_help(no_cog_commands, no_cog=True))
+
+        slash_lines = [
+            "`/reply` `/snippet` `/logs` `/note` `/blocked` `/control` `/snooze`",
+            "`/debug` `/config` `/alias` `/permissions` `/oauth` `/autotrigger`",
+            "`/plugins` `/threadmenu`",
+            "",
+            "Pick an `action` from autocomplete on each command.",
+        ]
+        slash_embed = discord.Embed(
+            title="Slash commands",
+            description="\n".join(slash_lines),
+            color=bot.main_color,
+        )
+        embeds.insert(0, slash_embed)
 
         session = EmbedPaginatorSession(self.context, *embeds, destination=self.get_destination())
         return await session.run()
@@ -693,12 +706,8 @@ class Utility(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @commands.hybrid_group(invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @utils.trigger_typing
-    async def debug(self, ctx):
-        """Shows the recent application logs of the bot."""
-
+    async def _debug_logs(self, ctx):
+        """Show recent application logs in paginated messages."""
         with open(self.bot.log_file_path, "r+", encoding="utf-8") as f:
             logs = f.read().strip()
 
@@ -713,8 +722,6 @@ class Utility(commands.Cog):
 
         messages = []
 
-        # Using Haskell formatting because it's similar to Python for exceptions
-        # and it does a fine job formatting the logs.
         msg = "```Haskell\n"
 
         for line in logs.splitlines(keepends=True):
@@ -740,16 +747,15 @@ class Utility(commands.Cog):
         session.current = len(messages) - 1
         return await session.run()
 
-    @debug.command(name="hastebin", aliases=["haste"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @utils.trigger_typing
-    async def debug_hastebin(self, ctx):
-        """Posts application-logs to Hastebin."""
-
+    async def _debug_hastebin(self, ctx, attachment: Optional[discord.Attachment] = None):
+        """Upload application logs or an attachment to Hastebin."""
         haste_url = os.environ.get("HASTE_URL", "https://hastebin.cc")
 
-        with open(self.bot.log_file_path, "rb+") as f:
-            logs = BytesIO(f.read().strip())
+        if attachment is not None:
+            logs = BytesIO(await attachment.read())
+        else:
+            with open(self.bot.log_file_path, "rb+") as f:
+                logs = BytesIO(f.read().strip())
 
         try:
             async with self.bot.session.post(haste_url + "/documents", data=logs) as resp:
@@ -773,17 +779,40 @@ class Utility(commands.Cog):
             embed.set_footer(text="Go to your console to see your logs.")
         await ctx.send(embed=embed)
 
-    @debug.command(name="clear", aliases=["wipe"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @utils.trigger_typing
-    async def debug_clear(self, ctx):
-        """Clears the locally cached logs."""
-
+    async def _debug_clear(self, ctx):
+        """Clear locally cached application logs."""
         with open(self.bot.log_file_path, "w"):
             pass
         await ctx.send(
             embed=discord.Embed(color=self.bot.main_color, description="Cached logs are now cleared.")
         )
+
+    @app_commands.command(name="debug", description="View, upload, or clear application debug logs.")
+    @app_commands.describe(
+        action="Debug action to perform",
+        attachment="Log file to upload for hastebin (defaults to bot log file)",
+    )
+    @app_commands.autocomplete(action=debug_action_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.OWNER)
+    async def debug_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        attachment: Optional[discord.Attachment] = None,
+    ):
+        """Dispatch merged slash debug actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, DEBUG_ACTIONS, command_name="debug"):
+            return
+
+        await ctx.defer()
+
+        if action == "help":
+            return await self._debug_logs(ctx)
+        if action == "hastebin":
+            return await self._debug_hastebin(ctx, attachment)
+        if action == "clear":
+            return await self._debug_clear(ctx)
 
     @commands.hybrid_command(aliases=["presence"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
@@ -1094,30 +1123,8 @@ class Utility(commands.Cog):
             await self.bot.config.update()
             await ctx.send(embed=embed)
 
-    @commands.hybrid_group(aliases=["configuration"], invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def config(self, ctx):
-        """
-        Modify changeable configuration variables for this bot.
-
-        Type `{prefix}config options` to view a list
-        of valid configuration variables.
-
-        Type `{prefix}config help config-name` for info
-         on a config.
-
-        To set a configuration variable:
-        - `{prefix}config set config-name value here`
-
-        To remove a configuration variable:
-        - `{prefix}config remove config-name`
-        """
-        await ctx.send_help(ctx.command)
-
-    @config.command(name="options", aliases=["list"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def config_options(self, ctx):
-        """Return a list of valid configuration names you can change."""
+    async def _config_options(self, ctx):
+        """List valid public configuration keys."""
         embeds = []
         for names in zip_longest(*(iter(sorted(self.bot.config.public_keys)),) * 15):
             description = "\n".join(f"`{name}`" for name in takewhile(lambda x: x is not None, names))
@@ -1131,13 +1138,9 @@ class Utility(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @config.command(name="set", aliases=["add"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(key="Configuration key to set", value="Configuration value")
-    @app_commands.autocomplete(key=config_key_autocomplete)
-    async def config_set(self, ctx, key: str.lower, *, value: str):
+    async def _config_set(self, ctx, key: str, value: str):
         """Set a configuration variable and its value."""
-
+        key = key.lower()
         keys = self.bot.config.public_keys
 
         if key in keys:
@@ -1149,7 +1152,6 @@ class Utility(commands.Cog):
                     color=self.bot.main_color,
                     description=f"Set `{key}` to `{self.bot.config[key]}`.",
                 )
-                # If turning on move-based snoozing, remind to set snoozed_category_id
                 if key == "snooze_behavior":
                     behavior = (
                         str(self.bot.config.get("snooze_behavior", convert=False)).strip().lower().strip('"')
@@ -1164,7 +1166,7 @@ class Utility(commands.Cog):
                             except Exception:
                                 valid = False
                         if not valid:
-                            example = f"`{self.bot.prefix}config set snoozed_category_id <category_id>`"
+                            example = f"`/config` with action `set`, key `snoozed_category_id`"
                             embed.add_field(
                                 name="Action required",
                                 value=(
@@ -1187,12 +1189,9 @@ class Utility(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @config.command(name="remove", aliases=["del", "delete"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(key="Configuration key to remove")
-    @app_commands.autocomplete(key=config_key_autocomplete)
-    async def config_remove(self, ctx, *, key: str.lower):
+    async def _config_remove(self, ctx, key: str):
         """Delete a set configuration variable."""
+        key = key.lower()
         keys = self.bot.config.public_keys
         if key in keys:
             self.bot.config.remove(key)
@@ -1213,16 +1212,10 @@ class Utility(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @config.command(name="get")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(key="Configuration key to view")
-    @app_commands.autocomplete(key=config_key_autocomplete)
-    async def config_get(self, ctx, *, key: str.lower = None):
-        """
-        Show the configuration variables that are currently set.
-
-        Leave `key` empty to show all currently set configuration variables.
-        """
+    async def _config_get(self, ctx, key: str = None):
+        """Show configuration variables that are currently set."""
+        if key:
+            key = key.lower()
         keys = self.bot.config.public_keys
 
         if key:
@@ -1240,12 +1233,9 @@ class Utility(commands.Cog):
                     color=self.bot.error_color,
                     description=f"`{key}` is an invalid key.",
                 )
-                embed.set_footer(
-                    text=f'Type "{self.bot.prefix}config options" for a list of config variables.'
-                )
+                embed.set_footer(text='Use `/config` with action `options` for a list of config variables.')
 
         else:
-            # Build one or more embeds, each with up to 25 fields
             base_desc = "Here is a list of currently set configuration variable(s)."
             author_name = "Current config(s):"
             icon = self.bot.user.display_avatar.url if self.bot.user.display_avatar else None
@@ -1272,26 +1262,17 @@ class Utility(commands.Cog):
                     e.add_field(name=name, value=f"`{value}`", inline=False)
                 embeds.append(e)
 
-        # Send one or many embeds depending on count.
-        # In the single-key branch above, variable 'embed' exists; in this multi branch, we only use 'embeds'.
         if key:
             return await ctx.send(embed=embed)
-        else:
-            if not embeds:
-                return await ctx.send("No public configuration keys are set.")
-            # Use the existing paginator consistently
-            paginator = EmbedPaginatorSession(ctx, *embeds)
-            await paginator.run()
-            return
+        if not embeds:
+            return await ctx.send("No public configuration keys are set.")
+        paginator = EmbedPaginatorSession(ctx, *embeds)
+        await paginator.run()
 
-    @config.command(name="help", aliases=["info"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(key="Configuration key to get help for")
-    @app_commands.autocomplete(key=config_key_autocomplete)
-    async def config_help(self, ctx, key: str.lower = None):
-        """
-        Show information on a specified configuration.
-        """
+    async def _config_help(self, ctx, key: str = None):
+        """Show information on a specified configuration key."""
+        if key is not None:
+            key = key.lower()
         if key is not None and not (
             key in self.bot.config.public_keys or key in self.bot.config.protected_keys
         ):
@@ -1354,31 +1335,51 @@ class Utility(commands.Cog):
         paginator.current = index
         await paginator.run()
 
-    @commands.hybrid_group(aliases=["aliases"], invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @app_commands.describe(name="Alias name to inspect")
-    @app_commands.autocomplete(name=alias_autocomplete)
-    async def alias(self, ctx, *, name: str.lower = None):
-        """
-        Create shortcuts to bot commands.
+    @app_commands.command(name="config", description="View and change bot configuration variables.")
+    @app_commands.describe(
+        action="Config action to perform",
+        key="Configuration key",
+        value="Configuration value for set",
+    )
+    @app_commands.autocomplete(action=config_action_autocomplete, key=config_key_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.OWNER)
+    async def config_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        key: str = "",
+        value: str = "",
+    ):
+        """Dispatch merged slash config actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, CONFIG_ACTIONS, command_name="config"):
+            return
 
-        When `{prefix}alias` is used by itself, this will retrieve
-        a list of alias that are currently set. `{prefix}alias-name` will show what the
-        alias point to.
+        await ctx.defer()
 
-        To use alias:
+        if action == "help":
+            resolved_key = key.lower() if key else None
+            return await self._config_help(ctx, resolved_key)
+        if action == "options":
+            return await self._config_options(ctx)
+        if action == "get":
+            resolved_key = key.lower() if key else None
+            return await self._config_get(ctx, resolved_key)
+        if action == "set":
+            if await slash_dispatch.reject_missing(interaction, key, "key", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, value, "value", for_action=action):
+                return
+            return await self._config_set(ctx, key, value)
+        if action == "remove":
+            if await slash_dispatch.reject_missing(interaction, key, "key", for_action=action):
+                return
+            return await self._config_remove(ctx, key)
 
-        First create an alias using:
-        - `{prefix}alias add alias-name other-command`
-
-        For example:
-        - `{prefix}alias add r reply`
-        - Now you can use `{prefix}r` as an replacement for `{prefix}reply`.
-
-        See also `{prefix}snippet`.
-        """
-
+    async def _alias_view(self, ctx, name: str = None):
+        """View a single alias or list all aliases."""
         if name is not None:
+            name = name.lower()
             val = self.bot.aliases.get(name)
             if val is None:
                 embed = utils.create_not_found_embed(name, self.bot.aliases.keys(), "Alias")
@@ -1406,24 +1407,23 @@ class Utility(commands.Cog):
                 )
                 return await ctx.send(embed=embed)
 
-            else:
-                embeds = []
-                for i, val in enumerate(values, start=1):
-                    embed = discord.Embed(
-                        color=self.bot.main_color,
-                        title=f'Alias - "{name}" - Step {i}:',
-                        description=val,
-                    )
-                    embeds += [embed]
-                session = EmbedPaginatorSession(ctx, *embeds)
-                return await session.run()
+            embeds = []
+            for i, val in enumerate(values, start=1):
+                embed = discord.Embed(
+                    color=self.bot.main_color,
+                    title=f'Alias - "{name}" - Step {i}:',
+                    description=val,
+                )
+                embeds += [embed]
+            session = EmbedPaginatorSession(ctx, *embeds)
+            return await session.run()
 
         if not self.bot.aliases:
             embed = discord.Embed(
                 color=self.bot.error_color,
                 description="You dont have any aliases at the moment.",
             )
-            embed.set_footer(text=f'Do "{self.bot.prefix}help alias" for more commands.')
+            embed.set_footer(text='Use `/alias` with action `add` for more commands.')
             embed.set_author(
                 name="Aliases",
                 icon_url=self.bot.get_guild_icon(guild=ctx.guild, size=128),
@@ -1444,14 +1444,9 @@ class Utility(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         await session.run()
 
-    @alias.command(name="raw")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @app_commands.describe(name="Alias name to view raw content for")
-    @app_commands.autocomplete(name=alias_autocomplete)
-    async def alias_raw(self, ctx, *, name: str.lower):
-        """
-        View the raw content of an alias.
-        """
+    async def _alias_raw(self, ctx, name: str):
+        """View the raw content of an alias."""
+        name = name.lower()
         val = self.bot.aliases.get(name)
         if val is None:
             embed = utils.create_not_found_embed(name, self.bot.aliases.keys(), "Alias")
@@ -1531,24 +1526,9 @@ class Utility(commands.Cog):
         await self.bot.config.update()
         return embed
 
-    @alias.command(name="add", aliases=["create", "make"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @app_commands.describe(name="Alias name to create", value="Command or snippet the alias points to")
-    @app_commands.autocomplete(name=alias_autocomplete)
-    async def alias_add(self, ctx, name: str.lower, *, value):
-        """
-        Add an alias.
-
-        Alias also supports multi-step aliases, to create a multi-step alias use quotes
-        to wrap each step and separate each step with `&&`. For example:
-
-        - `{prefix}alias add movenreply "move admin-category" && "reply Thanks for reaching out to the admins"`
-
-        However, if you run into problems, try wrapping the command with quotes. For example:
-
-        - This will fail: `{prefix}alias add reply You'll need to type && to work`
-        - Correct method: `{prefix}alias add reply "You'll need to type && to work"`
-        """
+    async def _alias_add(self, ctx, name: str, value: str):
+        """Add a new alias."""
+        name = name.lower()
         embed = None
         if self.bot.get_command(name):
             embed = discord.Embed(
@@ -1582,13 +1562,9 @@ class Utility(commands.Cog):
             embed = await self.make_alias(name, value, "Added")
         return await ctx.send(embed=embed)
 
-    @alias.command(name="remove", aliases=["del", "delete"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @app_commands.describe(name="Alias name to remove")
-    @app_commands.autocomplete(name=alias_autocomplete)
-    async def alias_remove(self, ctx, *, name: str.lower):
+    async def _alias_remove(self, ctx, name: str):
         """Remove an alias."""
-
+        name = name.lower()
         if name in self.bot.aliases:
             self.bot.aliases.pop(name)
             await self.bot.config.update()
@@ -1603,14 +1579,9 @@ class Utility(commands.Cog):
 
         return await ctx.send(embed=embed)
 
-    @alias.command(name="edit")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    @app_commands.describe(name="Alias name to edit", value="New command or snippet target")
-    @app_commands.autocomplete(name=alias_autocomplete)
-    async def alias_edit(self, ctx, name: str.lower, *, value):
-        """
-        Edit an alias.
-        """
+    async def _alias_edit(self, ctx, name: str, value: str):
+        """Edit an existing alias."""
+        name = name.lower()
         if name not in self.bot.aliases:
             embed = utils.create_not_found_embed(name, self.bot.aliases.keys(), "Alias")
             return await ctx.send(embed=embed)
@@ -1618,31 +1589,51 @@ class Utility(commands.Cog):
         embed = await self.make_alias(name, value, "Edited")
         return await ctx.send(embed=embed)
 
-    @commands.hybrid_group(aliases=["perms"], invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def permissions(self, ctx):
-        """
-        Set the permissions for Modmail commands.
+    @app_commands.command(name="alias", description="Create and manage command aliases.")
+    @app_commands.describe(
+        action="Alias action to perform",
+        name="Alias name",
+        value="Command or snippet target for add or edit",
+    )
+    @app_commands.autocomplete(action=alias_action_autocomplete, name=alias_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.MODERATOR)
+    async def alias_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        name: str = "",
+        value: str = "",
+    ):
+        """Dispatch merged slash alias actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, ALIAS_ACTIONS, command_name="alias"):
+            return
 
-        You may set permissions based on individual command names, or permission
-        levels.
+        await ctx.defer()
 
-        Acceptable permission levels are:
-            - **Owner** [5] (absolute control over the bot)
-            - **Administrator** [4] (administrative powers such as setting activities)
-            - **Moderator** [3] (ability to block)
-            - **Supporter** [2] (access to core Modmail supporting functions)
-            - **Regular** [1] (most basic interactions such as help and about)
-
-        By default, owner is set to the absolute bot owner and regular is `@everyone`.
-
-        To set permissions, see `{prefix}help permissions add`; and to change permission level for specific
-        commands see `{prefix}help permissions override`.
-
-        Note: You will still have to manually give/take permission to the Modmail
-        category to users/roles.
-        """
-        await ctx.send_help(ctx.command)
+        if action == "view":
+            resolved_name = name.lower() if name else None
+            return await self._alias_view(ctx, resolved_name)
+        if action == "raw":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            return await self._alias_raw(ctx, name)
+        if action == "add":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, value, "value", for_action=action):
+                return
+            return await self._alias_add(ctx, name, value)
+        if action == "remove":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            return await self._alias_remove(ctx, name)
+        if action == "edit":
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, value, "value", for_action=action):
+                return
+            return await self._alias_edit(ctx, name, value)
 
     @staticmethod
     def _verify_user_or_role(user_or_role):
@@ -1671,33 +1662,23 @@ class Utility(commands.Cog):
         }
         return transform.get(name, PermissionLevel.INVALID)
 
-    @permissions.command(name="override")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(
-        command_name="Command to override permission level for",
-        level_name="Permission level to assign",
-    )
-    @app_commands.autocomplete(
-        command_name=command_name_autocomplete,
-        level_name=permission_level_autocomplete,
-    )
-    async def permissions_override(self, ctx, command_name: str.lower, *, level_name: str):
-        """
-        Change a permission level for a specific command.
+    async def _permissions_help(self, ctx):
+        """Show permissions command overview."""
+        embed = discord.Embed(
+            title="Permissions",
+            color=self.bot.main_color,
+            description=(
+                "Set permissions for Modmail commands by command name or permission level.\n\n"
+                "Levels: **Owner** [5], **Administrator** [4], **Moderator** [3], "
+                "**Supporter** [2], **Regular** [1].\n\n"
+                "Use `/permissions` with actions `add`, `remove`, `override`, or `get`."
+            ),
+        )
+        await ctx.send(embed=embed)
 
-        Examples:
-        - `{prefix}perms override reply administrator`
-        - `{prefix}perms override "plugin enabled" moderator`
-
-        To undo a permission override, see `{prefix}help permissions remove`.
-
-        Example:
-        - `{prefix}perms remove override reply`
-        - `{prefix}perms remove override plugin enabled`
-
-        You can retrieve a single or all command level override(s), see`{prefix}help permissions get`.
-        """
-
+    async def _permissions_override(self, ctx, command_name: str, level_name: str):
+        """Change a permission level for a specific command."""
+        command_name = command_name.lower()
         command = self.bot.get_command(command_name)
         if command is None:
             embed = discord.Embed(
@@ -1731,47 +1712,22 @@ class Utility(commands.Cog):
             )
         return await ctx.send(embed=embed)
 
-    @permissions.command(name="add", usage="[command/level] [name] [user/role]")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(
-        type_="Whether to add permission for a command or level",
-        name="Command name or permission level",
-        user_or_role="User or role to grant permission to",
-    )
-    @app_commands.autocomplete(
-        type_=permission_type_autocomplete,
-        name=permissions_name_autocomplete,
-        user_or_role=member_role_autocomplete,
-    )
-    async def permissions_add(
-        self,
-        ctx,
-        type_: str.lower,
-        name: str,
-        *,
-        user_or_role: str,
-    ):
-        """
-        Add a permission to a command or a permission level.
+    async def _permissions_add(self, ctx, target_type: str, name: str, user_or_role):
+        """Add a permission to a command or permission level."""
+        if isinstance(user_or_role, str):
+            user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
-        For sub commands, wrap the complete command name with quotes.
-        To find a list of permission levels, see `{prefix}help perms`.
-
-        Examples:
-        - `{prefix}perms add level REGULAR everyone`
-        - `{prefix}perms add command reply @user`
-        - `{prefix}perms add command "plugin enabled" @role`
-        - `{prefix}perms add command help 984301093849028`
-
-        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
-        """
-        user_or_role = await self._resolve_member_role(ctx, user_or_role)
-
-        if type_ not in {"command", "level"}:
-            return await ctx.send_help(ctx.command)
+        target_type = target_type.lower()
+        if target_type not in {"command", "level"}:
+            embed = discord.Embed(
+                title="Error",
+                color=self.bot.error_color,
+                description="`target_type` must be `command` or `level` for add.",
+            )
+            return await ctx.send(embed=embed)
 
         command = level = None
-        if type_ == "command":
+        if target_type == "command":
             name = name.lower()
             command = self.bot.get_command(name)
             check = command is not None
@@ -1783,12 +1739,17 @@ class Utility(commands.Cog):
             embed = discord.Embed(
                 title="Error",
                 color=self.bot.error_color,
-                description=f"The referenced {type_} does not exist: `{name}`.",
+                description=f"The referenced {target_type} does not exist: `{name}`.",
             )
             return await ctx.send(embed=embed)
 
-        value = self._verify_user_or_role(user_or_role)
-        if type_ == "command":
+        try:
+            value = self._verify_user_or_role(user_or_role)
+        except commands.BadArgument as exc:
+            embed = discord.Embed(title="Error", color=self.bot.error_color, description=str(exc))
+            return await ctx.send(embed=embed)
+
+        if target_type == "command":
             name = command.qualified_name
             await self.bot.update_perms(name, value)
         else:
@@ -1823,56 +1784,23 @@ class Utility(commands.Cog):
         )
         return await ctx.send(embed=embed)
 
-    @permissions.command(
-        name="remove",
-        aliases=["del", "delete", "revoke"],
-        usage="[command/level] [name] [user/role] or [override] [command name]",
-    )
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(
-        type_="Whether to remove command, level, or override permission",
-        name="Command name or permission level",
-        user_or_role="User or role to revoke permission from",
-    )
-    @app_commands.autocomplete(
-        type_=permission_type_autocomplete,
-        name=permissions_name_autocomplete,
-        user_or_role=member_role_autocomplete,
-    )
-    async def permissions_remove(
-        self,
-        ctx,
-        type_: str.lower,
-        name: str,
-        *,
-        user_or_role: Optional[str] = None,
-    ):
-        """
-        Remove permission to use a command, permission level, or command level override.
-
-        For sub commands, wrap the complete command name with quotes.
-        To find a list of permission levels, see `{prefix}help perms`.
-
-        Examples:
-        - `{prefix}perms remove level REGULAR everyone`
-        - `{prefix}perms remove command reply @user`
-        - `{prefix}perms remove command "plugin enabled" @role`
-        - `{prefix}perms remove command help 984301093849028`
-        - `{prefix}perms remove override block`
-        - `{prefix}perms remove override "snippet add"`
-
-        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
-        """
-        if user_or_role is not None:
+    async def _permissions_remove(self, ctx, target_type: str, name: str, user_or_role=None):
+        """Remove command, level, or override permissions."""
+        target_type = target_type.lower()
+        if user_or_role is not None and isinstance(user_or_role, str):
             user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
-        if type_ not in {"command", "level", "override"} or (type_ != "override" and user_or_role is None):
-            return await ctx.send_help(ctx.command)
+        if target_type not in {"command", "level", "override"} or (
+            target_type != "override" and user_or_role is None
+        ):
+            embed = discord.Embed(
+                title="Error",
+                color=self.bot.error_color,
+                description="Provide `target_type`, `name`, and `target` for command/level remove.",
+            )
+            return await ctx.send(embed=embed)
 
-        if type_ == "override":
-            extension = ctx.kwargs["user_or_role"]
-            if extension is not None:
-                name += f" {extension}"
+        if target_type == "override":
             name = name.lower()
             name = getattr(self.bot.get_command(name), "qualified_name", name)
             level = self.bot.config["override_command_level"].get(name)
@@ -1897,7 +1825,7 @@ class Utility(commands.Cog):
             return await ctx.send(embed=embed)
 
         level = None
-        if type_ == "command":
+        if target_type == "command":
             name = name.lower()
             name = getattr(self.bot.get_command(name), "qualified_name", name)
         else:
@@ -1911,10 +1839,14 @@ class Utility(commands.Cog):
                 return await ctx.send(embed=embed)
             name = level.name
 
-        value = self._verify_user_or_role(user_or_role)
+        try:
+            value = self._verify_user_or_role(user_or_role)
+        except commands.BadArgument as exc:
+            embed = discord.Embed(title="Error", color=self.bot.error_color, description=str(exc))
+            return await ctx.send(embed=embed)
         await self.bot.update_perms(level or name, value, add=False)
 
-        if type_ == "level":
+        if target_type == "level":
             if level > PermissionLevel.REGULAR:
                 if value == -1:
                     logger.info("Denying @everyone access to Modmail category.")
@@ -2008,54 +1940,17 @@ class Utility(commands.Cog):
             )
         return embed
 
-    @permissions.command(name="get", usage="[@user] or [command/level/override] [name]")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(
-        user_or_role="User, role, or get mode (command/level/override)",
-        name="Command name or permission level when using a get mode",
-    )
-    @app_commands.autocomplete(
-        user_or_role=permissions_get_target_autocomplete,
-        name=permissions_name_autocomplete,
-    )
-    async def permissions_get(
-        self,
-        ctx,
-        user_or_role: str,
-        *,
-        name: str = None,
-    ):
-        """
-        View the currently-set permissions.
-
-        To find a list of permission levels, see `{prefix}help perms`.
-
-        To view all command and level permissions:
-
-        Examples:
-        - `{prefix}perms get @user`
-        - `{prefix}perms get 984301093849028`
-
-        To view all users and roles of a command or level permission:
-
-        Examples:
-        - `{prefix}perms get command reply`
-        - `{prefix}perms get command plugin remove`
-        - `{prefix}perms get level SUPPORTER`
-
-        To view command level overrides:
-
-        Examples:
-        - `{prefix}perms get override block`
-        - `{prefix}perms get override permissions add`
-
-        Do not ping `@everyone` for granting permission to everyone, use "everyone" or "all" instead.
-        """
+    async def _permissions_get(self, ctx, user_or_role, name: str = None):
+        """View currently-set permissions for a user, command, level, or override."""
         if user_or_role not in {"command", "level", "override"}:
             user_or_role = await self._resolve_member_role(ctx, user_or_role)
 
         if name is None and user_or_role not in {"command", "level", "override"}:
-            value = str(self._verify_user_or_role(user_or_role))
+            try:
+                value = str(self._verify_user_or_role(user_or_role))
+            except commands.BadArgument as exc:
+                embed = discord.Embed(title="Error", color=self.bot.error_color, description=str(exc))
+                return await ctx.send(embed=embed)
 
             cmds = []
             levels = []
@@ -2119,8 +2014,8 @@ class Utility(commands.Cog):
                     else:
                         for items in zip_longest(*(iter(sorted(overrides.items())),) * 15):
                             description = "\n".join(
-                                ": ".join((f"`{name}`", level))
-                                for name, level in takewhile(lambda x: x is not None, items)
+                                ": ".join((f"`{cmd_name}`", level))
+                                for cmd_name, level in takewhile(lambda x: x is not None, items)
                             )
                             embed = discord.Embed(color=self.bot.main_color, description=description)
                             embed.set_author(
@@ -2153,7 +2048,12 @@ class Utility(commands.Cog):
                 return await ctx.send(embed=embed)
 
             if user_or_role not in {"command", "level"}:
-                return await ctx.send_help(ctx.command)
+                embed = discord.Embed(
+                    title="Error",
+                    color=self.bot.error_color,
+                    description="Provide a user/role in `target`, or use `target_type` command/level/override.",
+                )
+                return await ctx.send(embed=embed)
             embeds = []
             if name is not None:
                 name = name.strip('"')
@@ -2192,33 +2092,112 @@ class Utility(commands.Cog):
         session = EmbedPaginatorSession(ctx, *embeds)
         return await session.run()
 
-    @commands.hybrid_group(invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def oauth(self, ctx):
-        """
-        Commands relating to logviewer oauth2 login authentication.
+    @app_commands.command(name="permissions", description="Manage Modmail command and level permissions.")
+    @app_commands.describe(
+        action="Permissions action to perform",
+        target_type="Whether to target a command, level, or override",
+        name="Command name or permission level",
+        target="User or role for add/remove/get",
+        command_name="Command for override",
+        level_name="Permission level for override",
+    )
+    @app_commands.autocomplete(
+        action=permissions_action_autocomplete,
+        target_type=permission_type_autocomplete,
+        name=permissions_name_autocomplete,
+        target=member_role_autocomplete,
+        command_name=command_name_autocomplete,
+        level_name=permission_level_autocomplete,
+    )
+    @checks.slash_has_permissions(PermissionLevel.OWNER)
+    async def permissions_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        target_type: str = "",
+        name: str = "",
+        target: str = "",
+        command_name: str = "",
+        level_name: str = "",
+    ):
+        """Dispatch merged slash permissions actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(
+            interaction, action, PERMISSIONS_ACTIONS, command_name="permissions"
+        ):
+            return
 
-        This functionality on your logviewer site is a [**Buy Me A Coffee**](https://buymeacoffee.com/modmaildev/membership) only feature.
-        """
-        await ctx.send_help(ctx.command)
+        await ctx.defer()
 
-    @oauth.command(name="whitelist")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(target="User or role to whitelist or un-whitelist")
-    @app_commands.autocomplete(target=member_role_autocomplete)
-    async def oauth_whitelist(self, ctx, target: str):
-        """
-        Whitelist or un-whitelist a user or role to have access to logs.
+        if action == "help":
+            return await self._permissions_help(ctx)
+        if action == "override":
+            if await slash_dispatch.reject_missing(interaction, command_name, "command_name", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, level_name, "level_name", for_action=action):
+                return
+            return await self._permissions_override(ctx, command_name, level_name)
+        if action == "add":
+            if await slash_dispatch.reject_missing(interaction, target_type, "target_type", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, target, "target", for_action=action):
+                return
+            return await self._permissions_add(ctx, target_type, name, target)
+        if action == "remove":
+            if await slash_dispatch.reject_missing(interaction, target_type, "target_type", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, name, "name", for_action=action):
+                return
+            if target_type != "override":
+                if await slash_dispatch.reject_missing(interaction, target, "target", for_action=action):
+                    return
+            return await self._permissions_remove(
+                ctx,
+                target_type,
+                name,
+                target if target else None,
+            )
+        if action == "get":
+            if target_type in {"command", "level", "override"}:
+                resolved_name = name if name else None
+                return await self._permissions_get(ctx, target_type, resolved_name)
+            if target:
+                return await self._permissions_get(ctx, target, name if name else None)
+            embed = discord.Embed(
+                title="Error",
+                color=self.bot.error_color,
+                description="Provide `target` (user/role) or `target_type` (command/level/override) for get.",
+            )
+            return await ctx.send(embed=embed)
 
-        `target` may be a role ID, name, mention, user ID, name, or mention.
-        """
-        target = await self._resolve_member_role(ctx, target)
+    async def _oauth_help(self, ctx):
+        """Show oauth command overview."""
+        embed = discord.Embed(
+            title="OAuth",
+            color=self.bot.main_color,
+            description=(
+                "Commands relating to logviewer oauth2 login authentication.\n\n"
+                "Use `/oauth` with actions `whitelist` or `show`."
+            ),
+        )
+        await ctx.send(embed=embed)
+
+    async def _oauth_whitelist(self, ctx, target):
+        """Whitelist or un-whitelist a user or role for log access."""
         if isinstance(target, str):
-            raise commands.BadArgument(f'User or Role "{target}" not found')
+            target = await self._resolve_member_role(ctx, target)
+        if isinstance(target, str):
+            embed = discord.Embed(
+                title="Error",
+                color=self.bot.error_color,
+                description=f'User or Role "{target}" not found.',
+            )
+            return await ctx.send(embed=embed)
 
         whitelisted = self.bot.config["oauth_whitelist"]
 
-        # target.id is not int??
         if target.id in whitelisted:
             whitelisted.remove(target.id)
             removed = True
@@ -2238,10 +2217,8 @@ class Utility(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @oauth.command(name="show", aliases=["get", "list", "view"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def oauth_show(self, ctx):
-        """Shows a list of users and roles that are whitelisted to view logs."""
+    async def _oauth_show(self, ctx):
+        """Show users and roles whitelisted for log access."""
         whitelisted = self.bot.config["oauth_whitelist"]
 
         users = []
@@ -2263,18 +2240,37 @@ class Utility(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @commands.hybrid_group(invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def autotrigger(self, ctx):
-        """Automatically trigger alias-like commands based on a certain keyword in the user's inital message"""
-        await ctx.send_help(ctx.command)
+    @app_commands.command(name="oauth", description="Manage logviewer OAuth whitelist.")
+    @app_commands.describe(
+        action="OAuth action to perform",
+        target="User or role to whitelist or un-whitelist",
+    )
+    @app_commands.autocomplete(action=oauth_action_autocomplete, target=member_role_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.OWNER)
+    async def oauth_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        target: str = "",
+    ):
+        """Dispatch merged slash oauth actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(interaction, action, OAUTH_ACTIONS, command_name="oauth"):
+            return
 
-    @autotrigger.command(name="add")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(keyword="Trigger keyword", command="Command or alias to run")
-    @app_commands.autocomplete(keyword=autotrigger_keyword_autocomplete)
-    async def autotrigger_add(self, ctx, keyword, *, command):
-        """Adds a trigger to automatically trigger an alias-like command"""
+        await ctx.defer()
+
+        if action == "help":
+            return await self._oauth_help(ctx)
+        if action == "whitelist":
+            if await slash_dispatch.reject_missing(interaction, target, "target", for_action=action):
+                return
+            return await self._oauth_whitelist(ctx, target)
+        if action == "show":
+            return await self._oauth_show(ctx)
+
+    async def _autotrigger_add(self, ctx, keyword: str, command: str):
+        """Add an autotrigger keyword."""
         if keyword in self.bot.auto_triggers:
             embed = discord.Embed(
                 title="Error",
@@ -2282,7 +2278,6 @@ class Utility(commands.Cog):
                 description=f"Another autotrigger with the same name already exists: `{keyword}`.",
             )
         else:
-            # command validation
             valid = False
             split_cmd = command.split(" ")
             for n in range(1, len(split_cmd) + 1):
@@ -2314,16 +2309,11 @@ class Utility(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @autotrigger.command(name="edit")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(keyword="Trigger keyword to edit", command="New command or alias to run")
-    @app_commands.autocomplete(keyword=autotrigger_keyword_autocomplete)
-    async def autotrigger_edit(self, ctx, keyword, *, command):
-        """Edits a pre-existing trigger to automatically trigger an alias-like command"""
+    async def _autotrigger_edit(self, ctx, keyword: str, command: str):
+        """Edit an existing autotrigger keyword."""
         if keyword not in self.bot.auto_triggers:
             embed = utils.create_not_found_embed(keyword, self.bot.auto_triggers.keys(), "Autotrigger")
         else:
-            # command validation
             valid = False
             split_cmd = command.split(" ")
             for n in range(1, len(split_cmd) + 1):
@@ -2355,12 +2345,8 @@ class Utility(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @autotrigger.command(name="remove")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(keyword="Trigger keyword to remove")
-    @app_commands.autocomplete(keyword=autotrigger_keyword_autocomplete)
-    async def autotrigger_remove(self, ctx, keyword):
-        """Removes a trigger to automatically trigger an alias-like command"""
+    async def _autotrigger_remove(self, ctx, keyword: str):
+        """Remove an autotrigger keyword."""
         try:
             del self.bot.auto_triggers[keyword]
         except KeyError:
@@ -2380,10 +2366,8 @@ class Utility(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-    @autotrigger.command(name="test")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def autotrigger_test(self, ctx, *, text):
-        """Tests a string against the current autotrigger setup"""
+    async def _autotrigger_test(self, ctx, text: str):
+        """Test a string against the current autotrigger setup."""
         for keyword in self.bot.auto_triggers:
             if self.bot.config.get("use_regex_autotrigger"):
                 check = re.search(keyword, text)
@@ -2408,10 +2392,8 @@ class Utility(commands.Cog):
         )
         return await ctx.send(embed=embed)
 
-    @autotrigger.command(name="list")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def autotrigger_list(self, ctx):
-        """Lists all autotriggers set up"""
+    async def _autotrigger_list(self, ctx):
+        """List all configured autotriggers."""
         embeds = []
         for keyword in self.bot.auto_triggers:
             command = self.bot.auto_triggers[keyword]
@@ -2427,11 +2409,63 @@ class Utility(commands.Cog):
                 discord.Embed(
                     title="No autotrigger set",
                     color=self.bot.error_color,
-                    description=f"Use `{self.bot.prefix}autotrigger add` to add new autotriggers.",
+                    description="Use `/autotrigger` with action `add` to add new autotriggers.",
                 )
             )
 
         await EmbedPaginatorSession(ctx, *embeds).run()
+
+    @app_commands.command(name="autotrigger", description="Manage keyword-based command autotriggers.")
+    @app_commands.describe(
+        action="Autotrigger action to perform",
+        keyword="Trigger keyword",
+        command="Command or alias to run for add or edit",
+        text="Text to test against autotriggers",
+    )
+    @app_commands.autocomplete(
+        action=autotrigger_action_autocomplete,
+        keyword=autotrigger_keyword_autocomplete,
+    )
+    @checks.slash_has_permissions(PermissionLevel.OWNER)
+    async def autotrigger_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        keyword: str = "",
+        command: str = "",
+        text: str = "",
+    ):
+        """Dispatch merged slash autotrigger actions."""
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+        if await slash_dispatch.reject_action(
+            interaction, action, AUTOTRIGGER_ACTIONS, command_name="autotrigger"
+        ):
+            return
+
+        await ctx.defer()
+
+        if action == "list":
+            return await self._autotrigger_list(ctx)
+        if action == "add":
+            if await slash_dispatch.reject_missing(interaction, keyword, "keyword", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, command, "command", for_action=action):
+                return
+            return await self._autotrigger_add(ctx, keyword, command)
+        if action == "edit":
+            if await slash_dispatch.reject_missing(interaction, keyword, "keyword", for_action=action):
+                return
+            if await slash_dispatch.reject_missing(interaction, command, "command", for_action=action):
+                return
+            return await self._autotrigger_edit(ctx, keyword, command)
+        if action == "remove":
+            if await slash_dispatch.reject_missing(interaction, keyword, "keyword", for_action=action):
+                return
+            return await self._autotrigger_remove(ctx, keyword)
+        if action == "test":
+            if await slash_dispatch.reject_missing(interaction, text, "text", for_action=action):
+                return
+            return await self._autotrigger_test(ctx, text)
 
     @commands.hybrid_command()
     @checks.has_permissions(PermissionLevel.OWNER)

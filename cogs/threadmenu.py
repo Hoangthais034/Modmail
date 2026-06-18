@@ -6,8 +6,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core import checks
-from core.autocomplete import threadmenu_label_autocomplete
+from core import checks, slash_dispatch
+from core.autocomplete import (
+    THREADMENU_ACTIONS,
+    threadmenu_action_autocomplete,
+    threadmenu_label_autocomplete,
+)
 from core.models import PermissionLevel
 
 
@@ -93,34 +97,36 @@ class ThreadCreationMenuCore(commands.Cog):
                 pass
         await self.bot.config.update()
 
-    # ----- commands -----
+    # ----- prefix-only command groups -----
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @commands.hybrid_group(invoke_without_command=True)
+    @commands.group(invoke_without_command=True)
     async def threadmenu(self, ctx):
-        """Thread-creation menu settings (core)."""
+        """Thread-creation menu settings (core).
+
+        Slash actions: toggle, show, option_show, option_remove, option_edit,
+        dump_config, reset, load_config via `/threadmenu`.
+        Prefix-only wizards: `threadmenu option add`, `threadmenu submenu` commands.
+        """
         await ctx.send_help(ctx.command)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.command(name="toggle")
-    async def threadmenu_toggle(self, ctx):
-        """Enable or disable the thread-creation menu.
+    @threadmenu.group(name="option", invoke_without_command=True)
+    async def threadmenu_option(self, ctx):
+        """Manage main-menu options (prefix add wizard only).
 
-        Toggles the global on/off state. When disabled, users won't see
-        or be able to use the interactive thread creation select menu.
+        Use `/threadmenu` for show, remove, and edit actions.
         """
+        await ctx.send_help(ctx.command)
+
+    async def _threadmenu_toggle(self, ctx):
+        """Enable or disable the thread-creation menu."""
         conf = self._get_conf()
         conf["enabled"] = not conf["enabled"]
         await self._save_conf(conf)
         await ctx.send(f"Thread-creation menu is now {'enabled' if conf['enabled'] else 'disabled'}.")
 
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.command(name="show")
-    async def threadmenu_show(self, ctx):
-        """Show all current main-menu options.
-
-        Lists every option (label + description) configured in the root
-        (non-submenu) select menu so you can review what users will see.
-        """
+    async def _threadmenu_show(self, ctx):
+        """Show all current main-menu options."""
         conf = self._get_conf()
         if not conf["options"]:
             return await ctx.send("There are no options in the main menu.")
@@ -129,25 +135,7 @@ class ThreadCreationMenuCore(commands.Cog):
             embed.add_field(name=v["label"], value=v["description"], inline=False)
         await ctx.send(embed=embed)
 
-    # ----- options -----
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.group(name="option", invoke_without_command=True)
-    async def threadmenu_option(self, ctx):
-        """Manage main-menu options (add/remove/edit/show).
-
-        Use subcommands:
-        - add: interactive wizard to create an option
-        - remove <label>: delete an option
-        - edit <label>: interactively modify an option
-        - show <label>: display full details (type, command/submenu, emoji)
-        """
-        await ctx.send_help(ctx.command)
-
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_option.command(name="show")
-    @app_commands.describe(label="Main menu option label")
-    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
-    async def threadmenu_option_show(self, ctx, *, label: str):
+    async def _threadmenu_option_show(self, ctx, *, label: str):
         """Show detailed information about a main-menu option."""
         conf = self._get_conf()
         key = label.lower().replace(" ", "_")
@@ -173,7 +161,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send(embed=embed)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_option.command(name="add", with_app_command=False)
+    @threadmenu_option.command(name="add")
     async def threadmenu_option_add(self, ctx):
         """Interactive wizard to add a main-menu option."""
         conf = self._get_conf()
@@ -210,7 +198,7 @@ class ThreadCreationMenuCore(commands.Cog):
             return
 
         await ctx.send("What is the description of the option? (not required)")
-        description = (await self.bot.wait_for("message", check=check)).content
+        description = (await ctx.wait_for("message", check=check)).content
 
         if description.lower() == "cancel":
             return await ctx.send("Cancelled.")
@@ -296,11 +284,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await self._save_conf(conf)
         await ctx.send("Option added.")
 
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_option.command(name="remove")
-    @app_commands.describe(label="Main menu option label")
-    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
-    async def threadmenu_option_remove(self, ctx, *, label: str):
+    async def _threadmenu_option_remove(self, ctx, *, label: str):
         """Remove a main-menu option by label."""
         conf = self._get_conf()
         key = label.lower().replace(" ", "_")
@@ -310,12 +294,8 @@ class ThreadCreationMenuCore(commands.Cog):
         await self._save_conf(conf)
         await ctx.send("Option removed.")
 
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_option.command(name="edit")
-    @app_commands.describe(label="Main menu option label")
-    @app_commands.autocomplete(label=threadmenu_label_autocomplete)
-    async def threadmenu_option_edit(self, ctx, *, label: str):
-        """Interactive wizard to edit a main-menu option."""
+    async def _threadmenu_option_edit(self, ctx, *, label: str):
+        """Interactive wizard to edit a main-menu option in the staff channel."""
         conf = self._get_conf()
         key = label.lower().replace(" ", "_")
         if key not in conf["options"]:
@@ -340,7 +320,7 @@ class ThreadCreationMenuCore(commands.Cog):
             "Use `none` to clear the value for non-required steps."
         )
         await ctx.send("What is the new description of the option? (not required)")
-        description = (await self.bot.wait_for("message", check=check)).content
+        description = (await ctx.wait_for("message", check=check)).content
         if description.lower() == "cancel":
             return await ctx.send("Cancelled.")
 
@@ -357,7 +337,7 @@ class ThreadCreationMenuCore(commands.Cog):
                 )
 
         await ctx.send("What is the new emoji of the option?")
-        emoji = (await self.bot.wait_for("message", check=check)).content
+        emoji = (await ctx.wait_for("message", check=check)).content
         if emoji.lower() == "cancel":
             return await ctx.send("Cancelled.")
 
@@ -369,7 +349,7 @@ class ThreadCreationMenuCore(commands.Cog):
             emoji = None
 
         await ctx.send("What is the new type of the option? (command/submenu)")
-        type_ = (await self.bot.wait_for("message", check=typecheck)).content.lower()
+        type_ = (await ctx.wait_for("message", check=typecheck)).content.lower()
         if type_ == "cancel":
             return await ctx.send("Cancelled.")
 
@@ -377,7 +357,7 @@ class ThreadCreationMenuCore(commands.Cog):
             await ctx.send("What is the new command to run for the option?")
         else:
             await ctx.send("What is the new label of the new submenu for the option?")
-        callback = (await self.bot.wait_for("message", check=check)).content
+        callback = (await ctx.wait_for("message", check=check)).content
         if type_ != "command":
             callback = callback.lower().replace(" ", "_")
         if callback.lower() == "cancel":
@@ -385,12 +365,11 @@ class ThreadCreationMenuCore(commands.Cog):
         if type_ == "submenu" and callback not in conf["submenus"]:
             return await ctx.send("That submenu does not exist. Use `threadmenu submenu create` to add it.")
 
-        # Category edit (optional)
         await ctx.send(
             "Optionally provide a new category for this option (mention, ID, or name).\n"
             "Send `skip` to keep current setting; send `default` or `none` to clear."
         )
-        cat_msg = await self.bot.wait_for("message", check=check)
+        cat_msg = await ctx.wait_for("message", check=check)
         cat_raw = cat_msg.content.strip()
         if cat_raw.lower() == "cancel":
             return await ctx.send("Cancelled.")
@@ -434,7 +413,7 @@ class ThreadCreationMenuCore(commands.Cog):
 
     # ----- submenus -----
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.group(name="submenu", invoke_without_command=True, with_app_command=False)
+    @threadmenu.group(name="submenu", invoke_without_command=True)
     async def threadmenu_submenu(self, ctx):
         """Manage submenus (create/delete/list/show and options within).
 
@@ -445,7 +424,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send_help(ctx.command)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.command(name="create", with_app_command=False)
+    @threadmenu_submenu.command(name="create")
     async def threadmenu_submenu_create(self, ctx, *, label: str):
         """Create an empty submenu that can hold nested options."""
         conf = self._get_conf()
@@ -459,7 +438,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send("Submenu created.")
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.command(name="delete", with_app_command=False)
+    @threadmenu_submenu.command(name="delete")
     async def threadmenu_submenu_delete(self, ctx, *, label: str):
         """Delete a submenu and all its options."""
         conf = self._get_conf()
@@ -471,7 +450,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send("Submenu deleted.")
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.command(name="list", with_app_command=False)
+    @threadmenu_submenu.command(name="list")
     async def threadmenu_submenu_list(self, ctx):
         """List all submenu keys currently configured."""
         conf = self._get_conf()
@@ -483,7 +462,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send(submenu_list)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.command(name="show", with_app_command=False)
+    @threadmenu_submenu.command(name="show")
     async def threadmenu_submenu_show(self, ctx, *, label: str):
         """Show the options configured inside a submenu."""
         conf = self._get_conf()
@@ -498,7 +477,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send(embed=embed)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.command(name="option-add", with_app_command=False)
+    @threadmenu_submenu.command(name="option-add")
     async def threadmenu_submenu_option_add(self, ctx, *, submenu: str):
         """Interactive wizard to add an option inside a submenu."""
         conf = self._get_conf()
@@ -539,7 +518,7 @@ class ThreadCreationMenuCore(commands.Cog):
             return
 
         await ctx.send("What is the description of the option? (not required)")
-        description = (await self.bot.wait_for("message", check=check)).content
+        description = (await ctx.wait_for("message", check=check)).content
         if description.lower() == "cancel":
             return await ctx.send("Cancelled.")
         if len(description) > 100:
@@ -616,7 +595,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send("Option added.")
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.command(name="option-remove", with_app_command=False)
+    @threadmenu_submenu.command(name="option-remove")
     async def threadmenu_submenu_option_remove(self, ctx, *, submenu: str):
         """Remove an option from a submenu via an interactive prompt."""
         conf = self._get_conf()
@@ -641,7 +620,7 @@ class ThreadCreationMenuCore(commands.Cog):
         await ctx.send("Option removed.")
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu_submenu.command(name="option-edit", with_app_command=False)
+    @threadmenu_submenu.command(name="option-edit")
     async def threadmenu_submenu_option_edit(self, ctx, *, submenu: str):
         """Interactive wizard to edit a submenu option."""
         conf = self._get_conf()
@@ -676,7 +655,7 @@ class ThreadCreationMenuCore(commands.Cog):
             return await ctx.send("That label does not exist.")
 
         await ctx.send("What is the new description of the option? (not required)")
-        description = (await self.bot.wait_for("message", check=check)).content
+        description = (await ctx.wait_for("message", check=check)).content
         if description.lower() == "cancel":
             return await ctx.send("Cancelled.")
 
@@ -764,25 +743,15 @@ class ThreadCreationMenuCore(commands.Cog):
         await self._save_conf(conf)
         await ctx.send("Option edited.")
 
-    # ----- import/export -----
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.command(name="dump_config")
-    async def threadmenu_dump_config(self, ctx):
+    async def _threadmenu_dump_config(self, ctx):
         """Dump the current core thread menu config to a file."""
         conf = self._get_conf()
         with open("thread_creation_menu_config.json", "w", encoding="utf-8") as f:
             json.dump(conf, f, indent=4)
         await ctx.send(file=discord.File("thread_creation_menu_config.json"))
 
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.command(name="reset")
-    async def threadmenu_reset(self, ctx):
-        """Reset ALL thread-creation menu settings to their defaults.
-
-        This clears options and submenus and restores every key starting with
-        `thread_creation_menu_` back to the default values. Confirmation required.
-        This action is irreversible.
-        """
+    async def _threadmenu_reset(self, ctx):
+        """Reset all thread-creation menu settings to defaults after confirmation."""
         warning = (
             "This will clear ALL thread menu options, submenus, and related settings and restore defaults.\n"
             "This action is irreversible. Type `confirm` within 30 seconds to proceed, or anything else to cancel."
@@ -793,7 +762,7 @@ class ThreadCreationMenuCore(commands.Cog):
             return m.author == ctx.author and m.channel == ctx.channel
 
         try:
-            reply = await self.bot.wait_for("message", check=check, timeout=30)
+            reply = await ctx.wait_for("message", check=check, timeout=30)
         except asyncio.TimeoutError:
             return await ctx.send("Timed out — reset cancelled.")
 
@@ -820,10 +789,8 @@ class ThreadCreationMenuCore(commands.Cog):
             f"Thread-creation menu configuration has been reset to defaults (reset {len(keys)} keys)."
         )
 
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    @threadmenu.command(name="load_config")
-    async def threadmenu_load_config(self, ctx):
-        """Load the thread menu config from an attached file."""
+    async def _threadmenu_load_config(self, ctx):
+        """Load the thread menu config from an attached JSON file."""
         if not ctx.message.attachments:
             return await ctx.send("You must attach a json file to load the config from.")
         b = await ctx.message.attachments[0].read()
@@ -849,6 +816,72 @@ class ThreadCreationMenuCore(commands.Cog):
 
         await self._save_conf(data)
         await ctx.send("Successfully loaded config into core.")
+
+    @app_commands.command(
+        name="threadmenu",
+        description=(
+            "Configure the thread-creation menu. Prefix-only wizards: "
+            "`threadmenu option add`, `threadmenu submenu` (create/delete/list/show, option-add/remove/edit)."
+        ),
+    )
+    @app_commands.describe(
+        action="Thread menu action to perform",
+        label="Main menu option label",
+        attachment="JSON config file for load_config",
+    )
+    @app_commands.autocomplete(action=threadmenu_action_autocomplete, label=threadmenu_label_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def threadmenu_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        label: str = "",
+        attachment: discord.Attachment = None,
+    ):
+        """Dispatch merged slash threadmenu actions."""
+        if await slash_dispatch.reject_action(
+            interaction, action, THREADMENU_ACTIONS, command_name="threadmenu"
+        ):
+            return
+
+        ctx = await checks.InteractionContext.from_interaction(
+            interaction,
+            attachments=[attachment] if attachment is not None else None,
+        )
+
+        if action in ("option_edit", "option_show", "option_remove"):
+            if await slash_dispatch.reject_missing(interaction, label, "label", for_action=action):
+                return
+
+        if action == "load_config" and attachment is None:
+            await slash_dispatch.send_ephemeral(
+                interaction,
+                slash_dispatch.missing_param("attachment", for_action=action),
+            )
+            return
+
+        if action == "option_edit":
+            await ctx.defer()
+            return await self._threadmenu_option_edit(ctx, label=label)
+
+        if action == "load_config":
+            await ctx.defer()
+            return await self._threadmenu_load_config(ctx)
+
+        await ctx.defer()
+
+        if action == "toggle":
+            return await self._threadmenu_toggle(ctx)
+        if action == "show":
+            return await self._threadmenu_show(ctx)
+        if action == "option_show":
+            return await self._threadmenu_option_show(ctx, label=label)
+        if action == "option_remove":
+            return await self._threadmenu_option_remove(ctx, label=label)
+        if action == "dump_config":
+            return await self._threadmenu_dump_config(ctx)
+        if action == "reset":
+            return await self._threadmenu_reset(ctx)
 
 
 async def setup(bot):

@@ -222,8 +222,20 @@ class ModmailBot(commands.Bot):
             if ctx.thread is None and ctx.channel is not None:
                 ctx.thread = await self.threads.find(channel=ctx.channel)
 
-        if self.extensions:
-            await self._sync_slash_commands()
+    @staticmethod
+    def _parse_guild_id(value) -> typing.Optional[int]:
+        """Parse a guild ID from config, env, or MongoDB values."""
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+            if not text:
+                return None
+            if "." in text:
+                text = text.split(".", 1)[0]
+            return int(text)
+        except (ValueError, TypeError):
+            return None
 
     def _get_slash_guild_objects(self) -> list[discord.Object]:
         """Return Discord guild objects used for slash command registration and sync."""
@@ -240,17 +252,32 @@ class ModmailBot(commands.Bot):
                     logger.warning("Invalid MODMAIL_GUILD_ID; skipping modmail guild slash sync.")
         return guilds
 
-    def _apply_slash_guild_scope(self) -> int:
-        """Assign guild scope to every app command so guild sync registers hybrid commands."""
+    def _prepare_guild_slash_commands(self) -> int:
+        """Copy global hybrid commands into guild scope for immediate guild sync."""
         guilds = self._get_slash_guild_objects()
         if not guilds:
             return 0
 
-        count = 0
-        for command in self.tree.walk_commands():
-            command.guilds = guilds
-            count += 1
-        return count
+        root_count = len(self.tree._global_commands)
+        if root_count > 100:
+            logger.warning(
+                "Command tree has %d root slash commands; Discord allows at most 100 per guild.",
+                root_count,
+            )
+
+        synced_count = 0
+        for guild in guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+            except app_commands.CommandLimitReached:
+                logger.exception(
+                    "Guild %s exceeds Discord's slash command limit. "
+                    "Keep fewer hybrid commands or leave admin commands prefix-only.",
+                    guild.id,
+                )
+                continue
+            synced_count = max(synced_count, len(self.tree._get_all_commands(guild=guild)))
+        return synced_count
 
     async def _sync_slash_commands(self):
         """Sync the application command tree to configured guilds when enabled."""
@@ -266,10 +293,10 @@ class ModmailBot(commands.Bot):
             )
             return
 
-        scoped = self._apply_slash_guild_scope()
+        scoped = self._prepare_guild_slash_commands()
         if scoped == 0:
             logger.warning(
-                "No slash commands found in the command tree. "
+                "No slash commands prepared for guild sync. "
                 "Ensure cogs loaded successfully before sync."
             )
             return
@@ -299,7 +326,7 @@ class ModmailBot(commands.Bot):
             logger.info("Synced %d slash command(s) to guild %s.", len(synced), guild.id)
             if len(synced) == 0 and scoped > 0:
                 logger.warning(
-                    "Guild slash sync returned 0 commands despite %d scoped command(s). "
+                    "Guild slash sync returned 0 commands despite %d prepared command(s). "
                     "Confirm the bot was invited with the applications.commands scope.",
                     scoped,
                 )
@@ -499,13 +526,17 @@ class ModmailBot(commands.Bot):
 
     @property
     def guild_id(self) -> typing.Optional[int]:
-        guild_id = self.config["guild_id"]
-        if guild_id is not None:
-            try:
-                return int(str(guild_id))
-            except ValueError:
-                self.config.remove("guild_id")
-                logger.critical("Invalid GUILD_ID set.")
+        raw = self.config.get("guild_id", convert=False)
+        parsed = self._parse_guild_id(raw)
+        if parsed is not None:
+            return parsed
+
+        env_parsed = self._parse_guild_id(os.environ.get("GUILD_ID"))
+        if env_parsed is not None:
+            return env_parsed
+
+        if raw not in (None, ""):
+            logger.critical("Invalid GUILD_ID set: %r", raw)
         else:
             logger.debug("No GUILD_ID set.")
         return None
@@ -605,17 +636,22 @@ class ModmailBot(commands.Bot):
                 self.config["override_command_level"].pop(command_name)
 
         command = self.get_command(command_name)
-        if command is None:
-            logger.debug("Command %s not found.", command_name)
-            return PermissionLevel.INVALID
-        level = next(
-            (check.permission_level for check in command.checks if hasattr(check, "permission_level")),
-            None,
-        )
-        if level is None:
-            logger.debug("Command %s does not have a permission level.", command_name)
-            return PermissionLevel.INVALID
-        return level
+        if command is not None:
+            level = next(
+                (check.permission_level for check in command.checks if hasattr(check, "permission_level")),
+                None,
+            )
+            if level is not None:
+                return level
+
+        app_command = self.tree.get_command(command_name, type=discord.AppCommandType.chat_input)
+        if app_command is not None:
+            callback = getattr(app_command, "callback", None)
+            if callback is not None and hasattr(callback, "permission_level"):
+                return callback.permission_level
+
+        logger.debug("Command %s not found.", command_name)
+        return PermissionLevel.INVALID
 
     async def on_connect(self):
         try:

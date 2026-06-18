@@ -17,11 +17,11 @@ from discord import app_commands
 from discord.ext import commands
 from packaging.version import Version
 
-from core import checks
-from core.autocomplete import plugin_name_autocomplete
+from core import checks, slash_dispatch
+from core.autocomplete import PLUGINS_ACTIONS, plugin_name_autocomplete, plugins_action_autocomplete
 from core.models import PermissionLevel, getLogger
 from core.paginator import EmbedPaginatorSession
-from core.utils import trigger_typing, truncate, safe_typing
+from core.utils import truncate, safe_typing
 
 logger = getLogger(__name__)
 
@@ -358,30 +358,22 @@ class Plugins(commands.Cog):
                 return
         return plugin
 
-    @commands.hybrid_group(aliases=["plugin"], invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def plugins(self, ctx):
-        """
-        Manage plugins for Modmail.
-        """
+    async def _plugins_help(self, ctx):
+        """Show plugins command overview for slash dispatch."""
+        embed = discord.Embed(
+            title="Plugins",
+            color=self.bot.main_color,
+            description=(
+                "Install and manage third-party Modmail plugins.\n\n"
+                "Use `/plugins` with actions `add`, `remove`, `update`, `reset`, `loaded`, "
+                "`registry`, or `registry_compact`.\n\n"
+                "`plugin_name` accepts a registry name, `user/repo/name[@branch]`, or `local/name`."
+            ),
+        )
+        await ctx.send(embed=embed)
 
-        await ctx.send_help(ctx.command)
-
-    @plugins.command(name="add", aliases=["install", "load"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @trigger_typing
-    @app_commands.describe(
-        plugin_name="Registry name or GitHub reference (user/repo/name[@branch], local/name)"
-    )
-    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
-    async def plugins_add(self, ctx, *, plugin_name: str):
-        """
-        Install a new plugin for the bot.
-
-        `plugin_name` can be the name of the plugin found in `{prefix}plugin registry`,
-        or a direct reference to a GitHub hosted plugin (in the format `user/repo/name[@branch]`)
-        or `local/name` for local plugins.
-        """
+    async def _plugins_add(self, ctx, plugin_name: str):
+        """Install a new plugin for the bot."""
 
         plugin = await self.parse_user_input(ctx, plugin_name, check_version=True)
         if plugin is None:
@@ -460,19 +452,8 @@ class Plugins(commands.Cog):
             )
         return await msg.edit(embed=embed)
 
-    @plugins.command(name="remove", aliases=["del", "delete"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(
-        plugin_name="Registry name or GitHub reference (user/repo/name[@branch], local/name)"
-    )
-    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
-    async def plugins_remove(self, ctx, *, plugin_name: str):
-        """
-        Remove an installed plugin of the bot.
-
-        `plugin_name` can be the name of the plugin found in `{prefix}plugin registry`, or a direct reference
-        to a GitHub hosted plugin (in the format `user/repo/name[@branch]`) or `local/name` for local plugins.
-        """
+    async def _plugins_remove(self, ctx, plugin_name: str):
+        """Remove an installed plugin from the bot."""
         plugin = await self.parse_user_input(ctx, plugin_name)
         if plugin is None:
             return
@@ -509,7 +490,8 @@ class Plugins(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    async def update_plugin(self, ctx, plugin_name):
+    async def _plugins_update_one(self, ctx, plugin_name):
+        """Update a single installed plugin."""
         logger.debug("Updating %s.", plugin_name)
         plugin = await self.parse_user_input(ctx, plugin_name, check_version=True)
         if plugin is None:
@@ -546,37 +528,16 @@ class Plugins(commands.Cog):
                 logger.debug("Updated %s.", plugin)
             return await ctx.send(embed=embed)
 
-    @plugins.command(name="update")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(
-        plugin_name="Registry name or GitHub reference; leave empty to update all installed plugins"
-    )
-    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
-    async def plugins_update(self, ctx, *, plugin_name: str = None):
-        """
-        Update a plugin for the bot.
-
-        `plugin_name` can be the name of the plugin found in `{prefix}plugin registry`, or a direct reference
-        to a GitHub hosted plugin (in the format `user/repo/name[@branch]`) or `local/name` for local plugins.
-
-        To update all plugins, do `{prefix}plugins update`.
-        """
-
+    async def _plugins_update(self, ctx, plugin_name: str = None):
+        """Update one or all installed plugins."""
         if plugin_name is None:
-            # pylint: disable=redefined-argument-from-local
-            for plugin_name in list(self.bot.config["plugins"]):
-                await self.update_plugin(ctx, plugin_name)
+            for name in list(self.bot.config["plugins"]):
+                await self._plugins_update_one(ctx, name)
         else:
-            await self.update_plugin(ctx, plugin_name)
+            await self._plugins_update_one(ctx, plugin_name)
 
-    @plugins.command(name="reset")
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def plugins_reset(self, ctx):
-        """
-        Reset all plugins for the bot.
-
-        Deletes all cache and plugins from config and unloads from the bot.
-        """
+    async def _plugins_reset(self, ctx):
+        """Reset all plugins and purge cached plugin data."""
         logger.warning("Purging plugins.")
         for ext in list(self.bot.extensions):
             if not ext.startswith("plugins."):
@@ -615,12 +576,8 @@ class Plugins(commands.Cog):
         )
         return await ctx.send(embed=embed)
 
-    @plugins.command(name="loaded", aliases=["enabled", "installed"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def plugins_loaded(self, ctx):
-        """
-        Show a list of currently loaded plugins.
-        """
+    async def _plugins_loaded(self, ctx):
+        """Show a list of currently loaded plugins."""
 
         if not self.bot.config.get("enable_plugins"):
             embed = discord.Embed(
@@ -664,19 +621,8 @@ class Plugins(commands.Cog):
         paginator = EmbedPaginatorSession(ctx, *embeds)
         await paginator.run()
 
-    @plugins.group(invoke_without_command=True, name="registry", aliases=["list", "info"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    @app_commands.describe(plugin_name="Plugin name or page number in the registry")
-    @app_commands.autocomplete(plugin_name=plugin_name_autocomplete)
-    async def plugins_registry(self, ctx, *, plugin_name: str = None):
-        """
-        Shows a list of all approved plugins.
-
-        Usage:
-        `{prefix}plugin registry` Details about all plugins.
-        `{prefix}plugin registry plugin-name` Details about the indicated plugin.
-        `{prefix}plugin registry page-number` Jump to a page in the registry.
-        """
+    async def _plugins_registry(self, ctx, *, plugin_name: str = None):
+        """Show the plugin registry or details for one plugin."""
 
         await self.populate_registry()
 
@@ -731,7 +677,7 @@ class Plugins(commands.Cog):
                 title=details["repository"],
             )
 
-            embed.add_field(name="Installation", value=f"```{self.bot.prefix}plugins add {name}```")
+            embed.add_field(name="Installation", value=f"```/plugins add {name}```")
 
             embed.set_author(name=details["title"], icon_url=details.get("icon_url"), url=plugin.link)
 
@@ -759,12 +705,8 @@ class Plugins(commands.Cog):
         paginator.current = index
         await paginator.run()
 
-    @plugins_registry.command(name="compact", aliases=["slim"])
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def plugins_registry_compact(self, ctx):
-        """
-        Shows a compact view of all plugins within the registry.
-        """
+    async def _plugins_registry_compact(self, ctx):
+        """Show a compact view of all plugins in the registry."""
 
         await self.populate_registry()
 
@@ -814,6 +756,54 @@ class Plugins(commands.Cog):
 
         paginator = EmbedPaginatorSession(ctx, *embeds)
         await paginator.run()
+
+    @app_commands.command(name="plugins", description="Install and manage Modmail plugins.")
+    @app_commands.describe(
+        action="Plugin action to perform",
+        plugin_name="Registry name, GitHub reference, or registry page number",
+    )
+    @app_commands.autocomplete(action=plugins_action_autocomplete, plugin_name=plugin_name_autocomplete)
+    @checks.slash_has_permissions(PermissionLevel.OWNER)
+    async def plugins_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        plugin_name: str = "",
+    ):
+        """Dispatch merged slash plugin actions."""
+        if await slash_dispatch.reject_action(interaction, action, PLUGINS_ACTIONS, command_name="plugins"):
+            return
+
+        ctx = await checks.InteractionContext.from_interaction(interaction)
+
+        if action == "add":
+            if await slash_dispatch.reject_missing(interaction, plugin_name, "plugin_name", for_action=action):
+                return
+            await ctx.defer(ephemeral=True)
+            return await self._plugins_add(ctx, plugin_name)
+
+        if action == "remove":
+            if await slash_dispatch.reject_missing(interaction, plugin_name, "plugin_name", for_action=action):
+                return
+
+        await ctx.defer()
+
+        if action == "help":
+            return await self._plugins_help(ctx)
+        if action == "remove":
+            return await self._plugins_remove(ctx, plugin_name)
+        if action == "update":
+            resolved_name = plugin_name or None
+            return await self._plugins_update(ctx, resolved_name)
+        if action == "reset":
+            return await self._plugins_reset(ctx)
+        if action == "loaded":
+            return await self._plugins_loaded(ctx)
+        if action == "registry":
+            resolved_name = plugin_name or None
+            return await self._plugins_registry(ctx, plugin_name=resolved_name)
+        if action == "registry_compact":
+            return await self._plugins_registry_compact(ctx)
 
 
 async def setup(bot):
