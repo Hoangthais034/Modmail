@@ -279,6 +279,25 @@ class ModmailBot(commands.Bot):
             synced_count = max(synced_count, len(self.tree._get_all_commands(guild=guild)))
         return synced_count
 
+    def _refresh_guild_app_command_scopes(self) -> None:
+        """Re-bind guild-scoped app commands after clear_commands wipes the local guild tree."""
+        for cog in self.cogs.values():
+            guilds_fn = getattr(cog, "_guilds", None)
+            if guilds_fn is None:
+                continue
+            cog_guilds = guilds_fn()
+            if not cog_guilds:
+                continue
+            for command in cog.walk_app_commands():
+                command.guilds = cog_guilds
+
+    def _count_guild_slash_commands(self) -> int:
+        """Return the highest guild-scoped slash command count across configured guilds."""
+        guilds = self._get_slash_guild_objects()
+        if not guilds:
+            return 0
+        return max(len(self.tree._get_all_commands(guild=guild)) for guild in guilds)
+
     async def _sync_slash_commands(self):
         """Sync the application command tree to configured guilds when enabled."""
         if not self.config.get("enable_slash_commands"):
@@ -293,15 +312,10 @@ class ModmailBot(commands.Bot):
             )
             return
 
-        scoped = self._prepare_guild_slash_commands()
-        if scoped == 0:
-            logger.warning(
-                "No slash commands prepared for guild sync. "
-                "Ensure cogs loaded successfully before sync."
-            )
+        guilds = self._get_slash_guild_objects()
+        if not guilds:
             return
 
-        guilds = self._get_slash_guild_objects()
         if self.config.get("slash_reset_on_start"):
             logger.info("Clearing guild slash commands before sync (slash_reset_on_start=true).")
             for guild in guilds:
@@ -310,6 +324,16 @@ class ModmailBot(commands.Bot):
                     await self.tree.sync(guild=guild)
                 except discord.HTTPException:
                     logger.exception("Failed to clear slash commands for guild %s.", guild.id)
+
+        self._prepare_guild_slash_commands()
+        self._refresh_guild_app_command_scopes()
+        scoped = self._count_guild_slash_commands()
+        if scoped == 0:
+            logger.warning(
+                "No slash commands prepared for guild sync. "
+                "Ensure cogs loaded successfully before sync."
+            )
+            return
 
         logger.info(
             "Registering %d slash command(s) for guild sync (enable_slash_commands=%s, guild_id=%s).",
