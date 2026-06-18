@@ -819,10 +819,7 @@ class ThreadCreationMenuCore(commands.Cog):
 
     @app_commands.command(
         name="threadmenu",
-        description=(
-            "Configure the thread-creation menu. Prefix-only wizards: "
-            "`threadmenu option add`, `threadmenu submenu` (create/delete/list/show, option-add/remove/edit)."
-        ),
+        description="Configure the thread-creation menu. Option add and submenu wizards stay prefix-only.",
     )
     @app_commands.describe(
         action="Thread menu action to perform",
